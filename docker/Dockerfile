@@ -3,10 +3,13 @@
 # LTX-2.5 Runpod Serverless – Dockerfile
 #
 # Design decisions (comment for future maintainers):
-#  • Base: runpod/pytorch:2.7.0-py3.11-cuda12.8.0-devel-ubuntu22.04
-#    This is Runpod's official curated image; it bundles the right CUDA
-#    drivers, nccl, cuDNN, and PyTorch 2.7 wheel. Using a community
-#    CUDA base and building PyTorch from scratch adds 30+ min to CI.
+#  • Base: runpod/pytorch:1.1.0-rc.154-cu1281-torch280-ubuntu2204
+#    Runpod changed their image naming scheme in 2025. The new format is:
+#      runpod/pytorch:<sdk-version>-cu<cuda>-torch<pytorch>-ubuntu<os>
+#    Selected tag: CUDA 12.8.1 + PyTorch 2.8.0 + Ubuntu 22.04
+#    Python 3.11 is the default in this image.
+#    To find available tags: https://hub.docker.com/r/runpod/pytorch/tags
+#    Fallback candidate: 1.1.0-rc.154-cu1290-torch291-ubuntu2204
 #  • Model weights are NOT baked in. They live on the network volume at
 #    /runpod-volume/models/ and are downloaded once on the very first
 #    cold start. See src/model_loader.py for the logic.
@@ -18,7 +21,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: dependency builder (keeps final layer cache efficient) ───────────
-FROM runpod/pytorch:2.7.0-py3.11-cuda12.8.0-devel-ubuntu22.04 AS builder
+FROM runpod/pytorch:1.1.0-rc.154-cu1281-torch280-ubuntu2204 AS builder
 
 WORKDIR /build
 
@@ -41,7 +44,7 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
 # ── Stage 2: lean runtime image ──────────────────────────────────────────────
-FROM runpod/pytorch:2.7.0-py3.11-cuda12.8.0-devel-ubuntu22.04 AS runtime
+FROM runpod/pytorch:1.1.0-rc.154-cu1281-torch280-ubuntu2204 AS runtime
 
 LABEL org.opencontainers.image.title="LTX-2.5 Runpod Serverless"
 LABEL org.opencontainers.image.description="Lightricks LTX-2.5 text-to-video / image-to-video serverless endpoint"
@@ -55,8 +58,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ── Copy installed Python packages from builder ───────────────────────────────
 # This avoids running pip again in the final stage.
-COPY --from=builder /usr/local/lib/python3.11/dist-packages \
-                    /usr/local/lib/python3.11/dist-packages
+# Copy Python site-packages — the new Runpod images use python3.11 but the
+# exact path may include a dist-packages or site-packages dir depending on
+# the base OS. We copy both to be safe; one will simply be empty.
+COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # ── Application source ────────────────────────────────────────────────────────

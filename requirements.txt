@@ -1,7 +1,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # LTX-2.5 Runpod Serverless – Python dependencies
 #
-# Pinned for CUDA 12.8 / PyTorch 2.7 base image.
+# Base image: runpod/pytorch:1.1.0-rc.154-cu1281-torch280-ubuntu2204
+# (CUDA 12.8.1 + PyTorch 2.8.0 + Python 3.11 + Ubuntu 22.04)
 # Do NOT pip-install torch here — it is already in the base image.
 # ─────────────────────────────────────────────────────────────────────────────
 
