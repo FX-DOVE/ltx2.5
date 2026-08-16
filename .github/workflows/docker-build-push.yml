@@ -1,22 +1,3 @@
-# .github/workflows/docker-build-push.yml
-# ─────────────────────────────────────────────────────────────────────────────
-# CI/CD: Build and push the LTX-2.5 serverless image to Docker Hub & GHCR
-# on every push to main, tag creation, and manual dispatch.
-#
-# Docker Hub Setup:
-#   1. Add repository secrets in GitHub repo -> Settings -> Secrets and variables -> Actions:
-#      - DOCKERHUB_USERNAME : Your Docker Hub username or organization
-#      - DOCKERHUB_TOKEN    : Your Docker Hub Personal Access Token (PAT)
-#
-# The built image is tagged with:
-#   :latest          — points to the most recent main build
-#   :<short-sha>     — immutable tag for the specific commit (e.g. sha-abc1234)
-#   :<tag>           — git version tag when pushing tags (e.g. v1.0.0)
-#
-# Usage in Runpod endpoint:
-#   Container image: <dockerhub-username>/ltx2.5:latest
-# ─────────────────────────────────────────────────────────────────────────────
-
 name: Build & Push Docker Image
 
 on:
@@ -24,71 +5,53 @@ on:
     branches:
       - main
     tags:
-      - 'v*.*.*'
       - 'v*'
   workflow_dispatch:
-    inputs:
-      image_tag:
-        description: 'Optional custom image tag (e.g. beta, dev)'
-        required: false
-        default: ''
 
 concurrency:
   group: docker-build-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  DEFAULT_IMAGE_NAME: ltx2.5
-
 jobs:
   build-and-push:
-    name: Build & Push to Docker Hub
+    name: Build & Push
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
       packages: write
 
     steps:
-      # ── 1. Checkout ───────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Docker Buildx ──────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── 3. Log in to Docker Hub ───────────────────────────────────────────
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # ── 4. Log in to GitHub Container Registry (Backup/Mirror) ────────────
-      - name: Log in to GHCR
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 5. Extract Docker metadata ────────────────────────────────────────
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
-            name=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DEFAULT_IMAGE_NAME }},enable=${{ secrets.DOCKERHUB_USERNAME != '' }}
-            name=ghcr.io/${{ github.repository }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/ltx2.5
+            ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short,prefix=sha-
             type=ref,event=tag
-            type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }}
 
-      # ── 6. Build and push ─────────────────────────────────────────────────
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -100,14 +63,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ── 7. Workflow summary ───────────────────────────────────────────────
-      - name: Write summary
+      - name: Write image tags to job summary
         run: |
           echo "## 🚀 Docker Image Built & Published Successfully" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Available Image Tags:" >> $GITHUB_STEP_SUMMARY
+          echo "### Published Image Tags:" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Use one of the above image references in your RunPod Serverless template configuration." >> $GITHUB_STEP_SUMMARY
