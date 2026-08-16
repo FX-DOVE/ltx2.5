@@ -128,21 +128,25 @@ In **Runpod Console → Settings → Secrets**, create:
 
 ---
 
-### Step 4 — Configure the GitHub Actions Workflow
+### Step 4 — Configure GitHub Actions & Docker Hub Secrets
 
-The workflow (`docker-build-push.yml`) uses `GITHUB_TOKEN` for GHCR — no extra secret needed.
-
-Push to `main` to trigger the first build:
+1. In your GitHub repository, go to **Settings → Secrets and variables → Actions → New repository secret**.
+2. Add the following secrets:
+   - `DOCKERHUB_USERNAME`: Your Docker Hub username or organization
+   - `DOCKERHUB_TOKEN`: Your Docker Hub Personal Access Token (PAT)
+3. Push to `main` (or run manually via **Actions → Build & Push Docker Image → Run workflow**):
 
 ```bash
 git add .
-git commit -m "Initial deployment"
+git commit -m "Configure Docker Hub CI/CD workflow"
 git push origin main
 ```
 
-After the workflow completes, note the image tag from the **job summary**:
+After the workflow completes, the image is published to Docker Hub and GHCR:
 ```
-ghcr.io/<YOUR_ORG>/ltx25-runpod-serverless:sha-abc1234
+<YOUR_DOCKERHUB_USERNAME>/ltx2.5:latest
+<YOUR_DOCKERHUB_USERNAME>/ltx2.5:sha-abc1234
+ghcr.io/<YOUR_ORG>/ltx2.5:latest
 ```
 
 ---
