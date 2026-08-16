@@ -1,0 +1,456 @@
+# LTX-2.5 Runpod Serverless Endpoint
+
+> **Lightricks LTX-Video-2.5** deployed as a cost-efficient **Runpod Serverless** endpoint with network-volume weight caching — pay nothing while idle, load instantly after the first cold start.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Developer Workflow                             │
+│                                                                         │
+│  git push → main                                                        │
+│       │                                                                 │
+│       ▼                                                                 │
+│  ┌─────────────┐     build & push      ┌──────────────────────┐        │
+│  │  GitHub     │ ──────────────────▶   │  ghcr.io             │        │
+│  │  Actions    │                       │  (container registry)│        │
+│  └─────────────┘                       └──────────┬───────────┘        │
+└────────────────────────────────────────────────────┼───────────────────┘
+                                                     │ image pull (on deploy)
+                                                     ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                           Runpod Platform                              │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Serverless Endpoint  (min=0 workers, max=2 workers)             │  │
+│  │                                                                  │  │
+│  │  Cold start sequence (once per new worker):                      │  │
+│  │    1. Mount network volume at /runpod-volume                     │  │
+│  │    2. ensure_weights_present()                                   │  │
+│  │       ├─ [FIRST TIME ONLY] download ~25 GB from Hugging Face     │  │
+│  │       └─ [SUBSEQUENT]      files already on volume → skip        │  │
+│  │    3. load_pipeline()  → load bfloat16 model into GPU VRAM       │  │
+│  │                                                                  │  │
+│  │  Warm request:                                                   │  │
+│  │    1. Validate JSON input (Pydantic)                             │  │
+│  │    2. Run LTX-2.5 inference                                      │  │
+│  │    3. Encode MP4  →  upload to S3/R2 (or Runpod temp storage)   │  │
+│  │    4. Return {status, video_url, generation_time_seconds, …}     │  │
+│  │                                                                  │  │
+│  │  ┌─────────────────────────────────────────────────────────┐    │  │
+│  │  │  Network Volume  (/runpod-volume)                        │    │  │
+│  │  │   /models/ltx-2.5/   ← weights live here permanently   │    │  │
+│  │  │   /.cache/huggingface/ ← HF metadata cache             │    │  │
+│  │  └─────────────────────────────────────────────────────────┘    │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Project Structure
+
+```
+ltx25-runpod-serverless/
+├── .github/
+│   └── workflows/
+│       └── docker-build-push.yml   # CI/CD: build + push to ghcr.io
+├── src/
+│   ├── handler.py        # Runpod serverless entrypoint
+│   ├── model_loader.py   # volume weight check + HF download + pipeline load
+│   ├── inference.py      # text2video / image2video / flf2video logic
+│   └── schema.py         # Pydantic input/output schemas
+├── docker/
+│   └── Dockerfile        # multi-stage, CUDA 12.8 + PyTorch 2.7, no weights
+├── scripts/
+│   └── download_weights.py   # standalone pre-population script
+├── tests/
+│   └── test_handler_local.py # unit + integration tests
+├── .dockerignore
+├── .gitignore
+├── .env.example          # copy to .env, fill in real values
+├── requirements.txt
+├── runpod.toml           # endpoint config reference (not parsed by Runpod)
+└── README.md
+```
+
+---
+
+## Quick Start (Zero to Live Endpoint)
+
+### Prerequisites
+
+- GitHub account (for GHCR)
+- Runpod account with billing set up
+- Hugging Face account with a **read token** that has **"read access to gated repos"** scope
+- Access granted to [`Lightricks/LTX-Video-2-0-5B-Distilled`](https://huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled) on Hugging Face
+
+---
+
+### Step 1 — Fork / clone this repo
+
+```bash
+git clone https://github.com/<YOUR_ORG>/ltx25-runpod-serverless.git
+cd ltx25-runpod-serverless
+cp .env.example .env
+# fill in HF_TOKEN and S3 credentials in .env
+```
+
+---
+
+### Step 2 — Create a Runpod Network Volume
+
+1. Go to **Runpod Console → Storage → Network Volumes → Create**.
+2. **Name:** `ltx25-weights` (or any name).
+3. **Size:** ≥ 100 GB (the LTX-2.5 checkpoint pack is ~25–30 GB; leave headroom for future updates).
+4. **Region:** same region you'll deploy your endpoint (latency matters for cold start).
+5. Note the **Volume ID** — you'll need it in Step 4.
+
+> **Tip:** Pre-populate the volume cheaply by spinning up a CPU Pod (or cheap GPU Pod), attaching the volume, and running:
+> ```bash
+> HF_TOKEN=hf_xxx RUNPOD_VOLUME_PATH=/runpod-volume python scripts/download_weights.py
+> ```
+> This avoids paying Serverless GPU time just for the download.
+
+---
+
+### Step 3 — Set Runpod Secrets
+
+In **Runpod Console → Settings → Secrets**, create:
+
+| Secret Name           | Value                  | Notes                               |
+|-----------------------|------------------------|-------------------------------------|
+| `HF_TOKEN`            | `hf_xxxxxxxxxxxx`      | Must have gated-repo read access    |
+| `S3_ACCESS_KEY_ID`    | your R2/S3 key id      | Optional — for persistent video URLs|
+| `S3_SECRET_ACCESS_KEY`| your R2/S3 secret      | Optional                            |
+
+---
+
+### Step 4 — Configure the GitHub Actions Workflow
+
+The workflow (`docker-build-push.yml`) uses `GITHUB_TOKEN` for GHCR — no extra secret needed.
+
+Push to `main` to trigger the first build:
+
+```bash
+git add .
+git commit -m "Initial deployment"
+git push origin main
+```
+
+After the workflow completes, note the image tag from the **job summary**:
+```
+ghcr.io/<YOUR_ORG>/ltx25-runpod-serverless:sha-abc1234
+```
+
+---
+
+### Step 5 — Create the Runpod Serverless Endpoint
+
+Go to **Runpod Console → Serverless → Endpoints → New Endpoint**.
+
+| Setting                | Value                                                    |
+|------------------------|----------------------------------------------------------|
+| **Name**               | `ltx25-video-gen`                                        |
+| **Container Image**    | `ghcr.io/<YOUR_ORG>/ltx25-runpod-serverless:latest`     |
+| **GPU Type**           | NVIDIA RTX PRO 6000 (96 GB) — *fallback: H100 80 GB*    |
+| **Min Workers**        | `0`                                                      |
+| **Max Workers**        | `2`                                                      |
+| **Idle Timeout**       | `60` seconds                                             |
+| **Execution Timeout**  | `300` seconds                                            |
+| **Container Disk**     | `50` GB                                                  |
+| **Network Volume**     | Select `ltx25-weights`, mount at `/runpod-volume`        |
+
+Under **Environment Variables**, add:
+
+```
+HF_TOKEN             = (select secret: HF_TOKEN)
+S3_ENDPOINT_URL      = https://YOUR_ACCOUNT.r2.cloudflarestorage.com
+S3_BUCKET            = your-bucket-name
+S3_REGION            = auto
+S3_KEY_PREFIX        = ltx-2.5
+S3_ACCESS_KEY_ID     = (select secret: S3_ACCESS_KEY_ID)
+S3_SECRET_ACCESS_KEY = (select secret: S3_SECRET_ACCESS_KEY)
+PRESIGNED_URL_TTL_SECONDS = 86400
+```
+
+---
+
+## API Reference
+
+### Run (async)
+
+```bash
+curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/run" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -d '{
+    "input": {
+      "prompt": "A serene mountain lake at golden hour, camera slowly panning right",
+      "mode": "text2video",
+      "resolution": "720p",
+      "num_frames": 97,
+      "fps": 24,
+      "num_inference_steps": 40,
+      "guidance_scale": 3.5,
+      "seed": 42
+    }
+  }'
+```
+
+Returns a job ID; poll `/status/<JOB_ID>` for completion.
+
+### RunSync (blocking, up to execution_timeout)
+
+```bash
+curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -d '{
+    "input": {
+      "prompt": "A lone astronaut walking on the moon surface",
+      "resolution": "480p",
+      "num_frames": 49,
+      "seed": 1234
+    }
+  }'
+```
+
+Returns the full result JSON when inference completes:
+
+```json
+{
+  "status": "success",
+  "video_url": "https://your-r2-bucket.r2.cloudflarestorage.com/ltx-2.5/abc123.mp4?...",
+  "duration_seconds": 2.04,
+  "generation_time_seconds": 47.3,
+  "seed_used": 1234,
+  "resolution": "1280x720",
+  "num_frames": 49,
+  "fps": 24
+}
+```
+
+### Image-to-Video
+
+```bash
+curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -d '{
+    "input": {
+      "prompt": "The person slowly raises their hand and waves",
+      "mode": "image2video",
+      "first_frame_image": "https://example.com/my-first-frame.jpg",
+      "resolution": "720p",
+      "num_frames": 97
+    }
+  }'
+```
+
+### First-Last-Frame (FLF)
+
+```bash
+curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -d '{
+    "input": {
+      "prompt": "A flower blooms from bud to full bloom",
+      "mode": "flf2video",
+      "first_frame_image": "https://example.com/bud.jpg",
+      "last_frame_image": "https://example.com/full-bloom.jpg",
+      "resolution": "720p",
+      "num_frames": 97
+    }
+  }'
+```
+
+### Input Schema Reference
+
+| Field                  | Type            | Default      | Description                                               |
+|------------------------|-----------------|--------------|-----------------------------------------------------------|
+| `prompt`               | string          | **required** | Text description (1–2000 chars)                           |
+| `mode`                 | enum            | `text2video` | `text2video` \| `image2video` \| `flf2video`              |
+| `first_frame_image`    | string          | `null`       | Base64 or HTTPS URL. Required for `image2video`/`flf2video`|
+| `last_frame_image`     | string          | `null`       | Base64 or HTTPS URL. Required for `flf2video`             |
+| `negative_prompt`      | string          | (see schema) | Negative conditioning text                                |
+| `resolution`           | enum            | `720p`       | `480p` (848×480) \| `720p` (1280×720) \| `1080p` (1920×1080)|
+| `num_frames`           | int             | `97`         | Must satisfy `(N−1) % 8 == 0`. Range: 9–257              |
+| `fps`                  | int             | `24`         | Output frame rate. Range: 8–30                           |
+| `num_inference_steps`  | int             | `40`         | Denoising steps. Range: 10–100                           |
+| `guidance_scale`       | float           | `3.5`        | CFG scale. Range: 1.0–10.0                               |
+| `seed`                 | int \| null     | `null`       | RNG seed for reproducibility. `null` = random            |
+
+---
+
+## Performance & Cost Notes
+
+### Timing Estimates (RTX PRO 6000, 96 GB)
+
+| Phase                            | Duration         | Notes                                        |
+|----------------------------------|------------------|----------------------------------------------|
+| First-ever cold start (download) | 8–15 min         | Downloads ~25–30 GB; paid once, volume-cached |
+| Subsequent cold starts           | 30–90 s          | Volume-load: weight check + VRAM load only   |
+| Warm inference — 480p / 49f      | ~20–35 s         | 40 steps default                             |
+| Warm inference — 720p / 97f      | ~60–120 s        | 40 steps default                             |
+| Warm inference — 1080p / 97f     | ~120–200 s       | May OOM on H100 80 GB                        |
+
+### Understanding Cold Starts vs. Warm Requests
+
+**Common misconception:** "Every request after idle re-downloads the weights."
+
+**Reality:**
+- The **network volume** persists between scale-to-zero events. Weights downloaded on the first cold start stay on the volume forever.
+- Subsequent cold starts only pay the cost of **re-loading weights from disk into GPU VRAM** (~30–90 s) — not re-downloading.
+- Warm workers (still running, in their idle window) serve requests with **no loading cost** at all.
+
+```
+                    [First cold start on fresh volume]
+  Worker starts → download 25 GB from HF (8–15 min) → load VRAM → serve
+
+  [Scale to zero after idle_timeout]
+
+                    [Any subsequent cold start]
+  Worker starts → check volume (files exist!) → skip download → load VRAM (~60 s) → serve
+                             ^^^^^^^^^^^^
+                          This is the key insight
+```
+
+### Cost Optimisation Tips
+
+- **`min_workers = 0`** — zero idle billing. Perfect for on-demand workloads.  
+- **`min_workers = 1`** — one worker always warm; eliminates cold starts for the first concurrent request. Costs ~\$0.80–1.20/hr depending on GPU. Use for latency-critical production apps.
+- **`idle_timeout = 60s`** — balances warm-start coverage for bursty traffic against idle billing.
+- **Pre-populate the volume** using a cheap CPU pod + `scripts/download_weights.py` to avoid paying GPU time for the initial download.
+
+---
+
+## Local Development & Testing
+
+### Unit Tests (no GPU required)
+
+```bash
+pip install -r requirements.txt
+python tests/test_handler_local.py
+# or
+pytest tests/test_handler_local.py -v
+```
+
+### Integration Test (GPU + volume required)
+
+```bash
+# Set env vars
+export HF_TOKEN=hf_xxx
+export RUNPOD_VOLUME_PATH=/path/to/your/volume
+
+python tests/test_handler_local.py --integration
+```
+
+### Running the Handler Locally (with `test_input.json`)
+
+Create `test_input.json`:
+```json
+{
+  "id": "local-test-001",
+  "input": {
+    "prompt": "a golden retriever playing fetch on a sunny beach",
+    "resolution": "480p",
+    "num_frames": 9,
+    "num_inference_steps": 5,
+    "seed": 42
+  }
+}
+```
+
+```bash
+cd src
+RUNPOD_VOLUME_PATH=/runpod-volume HF_TOKEN=hf_xxx \
+  python handler.py  # Runpod SDK reads test_input.json automatically in local mode
+```
+
+---
+
+## Troubleshooting
+
+### `EnvironmentError: Runpod network volume not found at '/runpod-volume'`
+
+**Cause:** The network volume isn't attached to the endpoint, or the mount path is wrong.
+
+**Fix:**
+1. In the Runpod console, open the endpoint → Edit → confirm the network volume is selected and mount path is `/runpod-volume`.
+2. Confirm the volume ID is correct (it's visible in Runpod Console → Storage).
+
+---
+
+### `RuntimeError: HF_TOKEN environment variable is not set`
+
+**Cause:** The Hugging Face token isn't available in the worker environment.
+
+**Fix:**
+1. Create a secret named `HF_TOKEN` in Runpod Console → Settings → Secrets.
+2. In the endpoint's Environment Variables, add `HF_TOKEN` referencing that secret.
+3. Verify the token itself has "read access to gated repositories" scope (check on [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)).
+
+---
+
+### `401 / 403` errors from Hugging Face during download
+
+**Cause:** The HF token is valid but either:
+- Doesn't have gated-repo scope, OR
+- You haven't accepted the model license on Hugging Face
+
+**Fix:**
+1. Visit [huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled](https://huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled), click **"Agree and access repository"**.
+2. Re-generate your token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) with **"Read access to gated repos"** scope checked.
+3. Update the `HF_TOKEN` secret in Runpod.
+
+---
+
+### `{"error": "out_of_memory", ...}` on inference
+
+**Cause:** The requested resolution/frames exceeds available VRAM.
+
+**Fix:**
+
+| GPU           | Safe config                          |
+|---------------|--------------------------------------|
+| RTX PRO 6000 (96 GB) | Up to 1080p / 97f           |
+| H100 80 GB    | Up to 720p / 97f (1080p may OOM)    |
+| A100 40 GB    | Up to 480p / 49f                    |
+
+Reduce `resolution`, `num_frames`, or `num_inference_steps`. The error response includes guidance text.
+
+---
+
+### Download stalls or partial weights on volume
+
+If `download_weights.py` was interrupted mid-run, re-run it. The sentinel-file check in `model_loader.py` detects missing/zero-size files and triggers a re-download automatically. `snapshot_download` from `huggingface_hub` handles partial-download resumption.
+
+---
+
+### Container fails to pull from `ghcr.io`
+
+**Cause:** The GHCR package is private by default.
+
+**Fix:**
+1. Go to your GitHub profile → Packages → `ltx25-runpod-serverless` → Package Settings → Change Visibility → **Public**.  
+   OR
+2. Configure Runpod to use a registry credential (Runpod Console → Endpoint → Registry Credentials) with a GitHub personal access token that has `read:packages` scope.
+
+---
+
+## GPU Fallback Comment
+
+> **Primary:** NVIDIA RTX PRO 6000 (96 GB GDDR7)  
+> **Fallback:** NVIDIA H100 SXM/NVL 80 GB HBM3  
+>
+> To enable the H100 fallback in the Runpod console, add H100 80GB as a secondary GPU type in the endpoint's GPU configuration. Note that 1080p generation may OOM on the H100 80 GB — if you see `out_of_memory` errors, switch callers to `resolution: "720p"`.
+
+---
+
+## License
+
+This deployment scaffold is MIT licensed. The LTX-Video-2.5 model weights are subject to [Lightricks' model license](https://huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled/blob/main/LICENSE).

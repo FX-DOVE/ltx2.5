@@ -1,0 +1,61 @@
+# .gitignore
+# ─────────────────────────────────────────────────────────────────────────────
+# Files that should never be committed to the repository.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.tox/
+
+# ── Test / coverage ───────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml             # junit output
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+__MACOSX/
+
+# ── Model weights (never in the repo — they live on the network volume) ────────
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+models/
+
+# ── Local test inputs / temp outputs ─────────────────────────────────────────
+test_input.json
+test_output/
+*.mp4
+*.tmp

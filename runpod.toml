@@ -1,0 +1,85 @@
+# runpod.toml
+# ─────────────────────────────────────────────────────────────────────────────
+# Reference configuration for the Runpod Serverless endpoint.
+#
+# THIS FILE IS DOCUMENTATION ONLY — Runpod does not read this file directly.
+# Use it as a copy-paste reference when configuring the endpoint in:
+#   • The Runpod web console  (https://www.runpod.io/console/serverless)
+#   • The Runpod API          (https://docs.runpod.io/serverless/references/api-reference)
+#   • runpodctl               (see README.md for deploy.sh example)
+#
+# Field explanations map to the Runpod console field names exactly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[endpoint]
+name = "ltx25-video-gen"
+
+# ── Container image ───────────────────────────────────────────────────────────
+# Replace <YOUR_GITHUB_ORG> with your GitHub username or org.
+# Use the commit-SHA tag in production for immutability:
+#   ghcr.io/<YOUR_GITHUB_ORG>/ltx25-runpod-serverless:sha-<7-char-sha>
+container_image = "ghcr.io/fx-dove/ltx2.5:latest"
+
+# ── GPU ───────────────────────────────────────────────────────────────────────
+# Primary: RTX PRO 6000 (96 GB GDDR7) — fits the full bfloat16 pipeline
+#          with headroom for 1080p generation.
+# Fallback: H100 SXM (80 GB HBM3) — can run up to 720p / 97 frames safely.
+#           1080p may OOM; reduce num_frames or resolution in that case.
+gpu_type_id = "NVIDIA RTX PRO 6000"   # Runpod GPU type string
+# fallback_gpu_type_id = "NVIDIA H100 80GB HBM3"   # uncomment to enable
+
+# ── Scaling ───────────────────────────────────────────────────────────────────
+# min_workers = 0  →  you pay NOTHING while idle.
+# Tradeoff: the first request after an idle period pays a cold-start penalty
+# (model load into VRAM, ~30–90 s depending on GPU). Every subsequent request
+# on a warm worker is instantaneous from a loading perspective.
+# See README.md § Cost Notes for a detailed breakdown.
+min_workers = 0
+max_workers = 2
+
+# ── Timeouts ─────────────────────────────────────────────────────────────────
+# idle_timeout: seconds a warm worker stays alive with no jobs before shutting
+# down.  Lower = less idle billing; higher = fewer cold starts for bursty traffic.
+# 60 s is a reasonable default: covers small bursts without much idle cost.
+idle_timeout = 60          # seconds
+
+# execution_timeout: maximum wall-clock seconds allowed for a single job.
+# 1080p / 97 frames / 40 steps typically takes 90–180 s on an RTX PRO 6000.
+# Set this higher than your slowest expected generation to avoid false timeouts.
+execution_timeout = 300    # seconds (5 min)
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+# container_disk_size: ephemeral disk for the container's OS + pip cache.
+# Weights do NOT live here — they live on the network volume.
+# 50 GB covers the base image, Python packages, and temporary video files.
+container_disk_size = 50   # GB
+
+# Network volume: attach an existing volume ≥ 100 GB.
+# The handler mounts it at /runpod-volume (default Runpod mount path).
+# Create the volume first at: Runpod Console → Storage → Network Volumes.
+[endpoint.network_volume]
+volume_id = "YOUR_NETWORK_VOLUME_ID"   # find this in the Runpod console
+mount_path = "/runpod-volume"
+
+# ── Environment variables ─────────────────────────────────────────────────────
+# Set secrets via Runpod Console → Secrets, then reference them here by name.
+# NEVER put real values in this file — it is committed to version control.
+[endpoint.env]
+
+# Required: Hugging Face token for downloading the gated LTX-Video model.
+# Create a secret named "HF_TOKEN" in the Runpod console and reference it.
+HF_TOKEN = { secret = "HF_TOKEN" }
+
+# Optional: S3-compatible storage for video uploads.
+# If not set, Runpod built-in temp storage is used (URLs valid ~1 hour).
+S3_ENDPOINT_URL = "https://YOUR_ACCOUNT.r2.cloudflarestorage.com"
+S3_BUCKET       = "your-bucket-name"
+S3_REGION       = "auto"
+S3_KEY_PREFIX   = "ltx-2.5"
+S3_ACCESS_KEY_ID     = { secret = "S3_ACCESS_KEY_ID" }
+S3_SECRET_ACCESS_KEY = { secret = "S3_SECRET_ACCESS_KEY" }
+PRESIGNED_URL_TTL_SECONDS = "86400"   # 24 hours
+
+# These are already set in the Dockerfile; listed here for documentation.
+HF_HUB_ENABLE_HF_TRANSFER = "1"
+PYTHONUNBUFFERED = "1"

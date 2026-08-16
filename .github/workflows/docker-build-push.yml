@@ -1,0 +1,108 @@
+# .github/workflows/docker-build-push.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# CI/CD: Build and push the LTX-2.5 serverless image to GitHub Container
+# Registry (ghcr.io) on every push to main, and on manual dispatch.
+#
+# The built image is tagged with both:
+#   :latest          — always points to the most recent main build
+#   :<git-sha>       — immutable tag for the specific commit (pin this in Runpod)
+#
+# Usage in Runpod endpoint:
+#   Container image: ghcr.io/<GITHUB_ORG>/<REPO_NAME>:latest
+#   (or pin to a specific SHA for production stability)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Build & Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:   # allow manual trigger from the GitHub Actions UI
+
+# Cancel in-progress runs for the same branch to avoid wasting runner minutes.
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # Image name follows ghcr.io convention: <owner>/<repo>.
+  # GitHub automatically sets GITHUB_REPOSITORY to "owner/repo".
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build & Push
+    runs-on: ubuntu-latest
+
+    # Required so GITHUB_TOKEN can write packages (push to ghcr.io).
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Docker Buildx ──────────────────────────────────────────────────
+      # Buildx is required for multi-platform builds and BuildKit cache exports.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. Log in to ghcr.io ──────────────────────────────────────────────
+      # GITHUB_TOKEN is automatically provided by Actions — no secret to manage.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Derive image metadata (tags + labels) ──────────────────────────
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # :latest on every push to main
+            type=raw,value=latest,enable={{is_default_branch}}
+            # :<sha> — immutable, 7-char short SHA
+            type=sha,format=short
+            # :<full-sha> — fully immutable
+            type=sha,format=long
+
+      # ── 5. Build and push ─────────────────────────────────────────────────
+      # NOTE: HF_TOKEN is intentionally NOT a build ARG — it is injected as
+      # a Runpod runtime secret, never baked into the image layer history.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache: speeds up subsequent builds by reusing
+          # unchanged layers.  "max" mode caches all layers, not just the
+          # final stage.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 6. Workflow summary ───────────────────────────────────────────────
+      # Print the image tags to the job summary so you can copy them directly
+      # into the Runpod endpoint "Container Image" field.
+      - name: Write image tags to job summary
+        run: |
+          echo "## 🐳 Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Copy one of these tags into your Runpod endpoint config:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Pinned SHA tag (recommended for production):**" >> $GITHUB_STEP_SUMMARY
+          echo "\`ghcr.io/${{ github.repository }}:sha-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY

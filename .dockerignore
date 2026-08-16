@@ -1,0 +1,67 @@
+# .dockerignore
+# ─────────────────────────────────────────────────────────────────────────────
+# Files excluded from the Docker build context.
+# A tight .dockerignore keeps the context small (faster CI) and prevents
+# secrets from accidentally leaking into the image.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Git ──────────────────────────────────────────────────────────────────────
+.git
+.gitignore
+.github
+
+# ── Secrets / local config ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example          # .env.example is safe to document, but excluded too
+                        # (it never contains real values)
+*.pem
+*.key
+
+# ── Python cache / build artifacts ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.tox/
+
+# ── Test artefacts ────────────────────────────────────────────────────────────
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+*.test_input.json
+
+# ── IDE / editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+__MACOSX/
+
+# ── Docs / meta (not needed at runtime) ──────────────────────────────────────
+README.md
+*.md
+docs/
+runpod.toml
+
+# ── Model weights (never in the image — they live on the network volume) ──────
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+models/
