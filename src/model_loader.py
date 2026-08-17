@@ -36,6 +36,13 @@ GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
 # Local directory where weights are cached on the network volume
 _sanitized_repo_name = MODEL_ID.replace("/", "--")
 WEIGHTS_DIR = VOLUME_ROOT / "models" / _sanitized_repo_name
+HF_CACHE_DIR = VOLUME_ROOT / "hf_cache"
+
+# Force HF cache paths to persistent volume
+os.environ["HF_HOME"] = str(HF_CACHE_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR)
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(HF_CACHE_DIR)
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # Sentinel files confirming a complete Diffusers pipeline
 SENTINEL_FILES = [
@@ -243,10 +250,12 @@ def _download_weights() -> None:
     logger.info(f"[model_loader] Starting snapshot_download of '{MODEL_ID}' -> {WEIGHTS_DIR}")
 
     try:
+        HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         snapshot_download(
             repo_id=MODEL_ID,
             repo_type="model",
             local_dir=str(WEIGHTS_DIR),
+            cache_dir=str(HF_CACHE_DIR),
             local_dir_use_symlinks=False,
             token=hf_token,
             max_workers=8,
