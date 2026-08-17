@@ -3,70 +3,62 @@ src/model_loader.py
 ─────────────────────────────────────────────────────────────────────────────
 Network-volume weight management and model loading for LTX-2.5.
 
-Responsibilities
-────────────────
-1. ensure_weights_present()
-   Called once at worker cold-start. Checks whether the LTX-2.5 checkpoint
-   files already exist on the Runpod network volume. If they do, it fast-
-   paths past any network I/O. If they don't (first-ever cold start on a
-   fresh volume), it downloads them from the gated Hugging Face repo using
-   huggingface_hub snapshot_download.
-
-2. load_pipeline()
-   Loads all model components (VAE, text encoder, transformer, scheduler)
-   into GPU memory and returns a ready-to-call LTXVideoPipeline. This is
-   called once per worker lifetime and the result is kept warm in a module-
-   level singleton.
-
-Design decisions worth noting:
-  • We use snapshot_download with local_dir=WEIGHTS_DIR and
-    local_dir_use_symlinks=False so that the real files live on the volume
-    and are not just symlinks into the HF cache. This is critical because
-    the HF_HOME cache directory is also on the volume — if both pointed at
-    the same location we'd get double storage usage.
-  • Weight existence is checked by verifying individual sentinel files
-    (not just the directory) to guard against partial downloads.
-  • torch.cuda.empty_cache() is called before model load to maximise
-    available VRAM — this matters if the handler process survived a previous
-    request that fragmented the allocator.
-  • We load in bfloat16 (the native LTX-2.5 dtype). int8 quantisation is
-    available via quanto but is not the default because it adds 2–3 minutes
-    to model load time with no measurable quality benefit at 96 GB VRAM.
+Supports:
+  • MODEL_ID              (default: "Lightricks/LTX-2.5-Diffusers")
+  • DTYPE                 (default: "bfloat16")
+  • GPU_MEMORY_UTILIZATION (default: 0.95)
+  • HF_TOKEN              (for gated repo download)
+  • RUNPOD_VOLUME_PATH    (default: "/runpod-volume")
+  • Optimized for NVIDIA RTX PRO 6000 96GB VRAM
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from huggingface_hub import snapshot_download
 from loguru import logger
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants
+# Configuration & Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 VOLUME_ROOT = Path(os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume"))
-WEIGHTS_DIR = VOLUME_ROOT / "models" / "ltx-2.5"
-HF_REPO_ID = "Lightricks/LTX-Video-2-0-5B-Distilled"  # The public HF repo name
-# NOTE: If Lightricks releases a newer repo ID or renames, update this constant.
+MODEL_ID = os.environ.get("MODEL_ID", "Lightricks/LTX-2.5-Diffusers")
+DTYPE_STR = os.environ.get("DTYPE", "bfloat16").lower()
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"))
 
-# Sentinel files we check to confirm the download is complete.
-# Checking a file list is more robust than checking dir existence (a partial
-# download would leave the directory but miss some files).
+# Local directory where weights are cached on the network volume
+_sanitized_repo_name = MODEL_ID.replace("/", "--")
+WEIGHTS_DIR = VOLUME_ROOT / "models" / _sanitized_repo_name
+
+# Sentinel files confirming a complete Diffusers pipeline
 SENTINEL_FILES = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
     "transformer/config.json",
     "vae/config.json",
-    "scheduler/scheduler_config.json",
     "text_encoder/config.json",
     "tokenizer/tokenizer.json",
 ]
 
-# Module-level pipeline singleton — loaded once per worker process.
-_pipeline: Optional[object] = None  # type: ignore[assignment]
+# Torch dtype map
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
+
+# Module-level pipeline singleton
+_pipeline: Optional[Any] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,124 +66,160 @@ _pipeline: Optional[object] = None  # type: ignore[assignment]
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def get_torch_dtype() -> torch.dtype:
+    """Return the configured torch dtype (default bfloat16)."""
+    return DTYPE_MAP.get(DTYPE_STR, torch.bfloat16)
+
+
 def ensure_weights_present() -> None:
     """
-    Idempotent weight-availability check.  Safe to call on every cold start.
-
-    Behaviour:
-      • If all sentinel files exist on the volume → log and return immediately.
-      • Otherwise → download the full snapshot to WEIGHTS_DIR via HF Hub.
-
-    Raises:
-      RuntimeError   if HF_TOKEN is missing or download fails.
-      EnvironmentError if the network volume is not mounted / writable.
+    Check if the model checkpoint exists on the network volume.
+    If not, download the snapshot from Hugging Face.
     """
-    _assert_volume_mounted()
-
-    t0 = time.monotonic()
-    missing = _missing_sentinel_files()
-
-    if not missing:
-        elapsed = time.monotonic() - t0
-        logger.info(
-            f"[model_loader] Weights already present on volume at {WEIGHTS_DIR} "
-            f"(checked in {elapsed:.2f}s) — skipping download."
+    logger.info(f"[model_loader] Checking weights for '{MODEL_ID}' on volume at {WEIGHTS_DIR}")
+    
+    if not VOLUME_ROOT.exists():
+        logger.warning(
+            f"[model_loader] Volume root '{VOLUME_ROOT}' is not mounted. "
+            "Will attempt direct loading / downloading to default cache if local storage allows."
         )
         return
 
+    # Check volume write permission
+    try:
+        test_file = VOLUME_ROOT / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+    except OSError as exc:
+        logger.warning(f"[model_loader] Volume root '{VOLUME_ROOT}' write test failed: {exc}")
+
+    missing = _missing_sentinel_files()
+    if not missing:
+        logger.info(f"[model_loader] All sentinel files present at {WEIGHTS_DIR} - skipping download.")
+        return
+
     logger.info(
-        f"[model_loader] Missing sentinel files: {missing}. "
-        f"Starting download from '{HF_REPO_ID}' → {WEIGHTS_DIR}"
+        f"[model_loader] Missing components: {missing}. "
+        f"Downloading '{MODEL_ID}' to {WEIGHTS_DIR}..."
     )
     _download_weights()
-    elapsed = time.monotonic() - t0
-    logger.info(f"[model_loader] Download complete in {elapsed:.1f}s.")
 
 
-def load_pipeline() -> object:
+def load_pipeline() -> Any:
     """
     Load LTX-2.5 into GPU memory and return the pipeline singleton.
-
-    Subsequent calls return the cached singleton without reloading.
-    Thread-safety: Runpod workers are single-threaded per handler invocation,
-    so we don't need a lock here.
+    Optimized for RTX PRO 6000 96GB VRAM.
     """
     global _pipeline
 
     if _pipeline is not None:
-        logger.debug("[model_loader] Pipeline already loaded — reusing singleton.")
+        logger.debug("[model_loader] Pipeline already loaded - returning cached singleton.")
         return _pipeline
 
     t0 = time.monotonic()
-    logger.info(f"[model_loader] Loading LTX-2.5 pipeline from {WEIGHTS_DIR} …")
+    dtype = get_torch_dtype()
+    hf_token = os.environ.get("HF_TOKEN")
 
-    # Free any lingering allocations before loading new model weights.
-    torch.cuda.empty_cache()
+    logger.info(f"[model_loader] Initializing LTX-2.5 Pipeline (dtype={dtype})...")
+
+    # Determine load source
+    if (WEIGHTS_DIR / "model_index.json").exists():
+        load_source = str(WEIGHTS_DIR)
+        logger.info(f"[model_loader] Loading from local volume path: {load_source}")
+    else:
+        load_source = MODEL_ID
+        logger.info(f"[model_loader] Local volume path empty or incomplete. Loading from HF repo: {load_source}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gpu_name = torch.cuda.get_device_name(0)
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logger.info(f"[model_loader] GPU: {gpu_name} ({total_vram_gb:.1f} GB VRAM)")
+    else:
+        gpu_name = "CPU"
+        total_vram_gb = 0.0
+        logger.warning("[model_loader] No CUDA GPU detected - running in CPU mode.")
+
+    # Dynamically import pipeline class
+    PipelineClass = _resolve_pipeline_class()
 
     try:
-        # Deferred import: we only need this at load time, not at module import.
-        # This keeps startup fast if load_pipeline() is never called (e.g. in tests).
-        from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline  # type: ignore
-
-        pipeline = LTXVideoPipeline.from_pretrained(
-            str(WEIGHTS_DIR),
-            torch_dtype=torch.bfloat16,
-            # device_map="balanced" would split across GPUs; for a single GPU
-            # this is equivalent to moving everything to cuda:0.
-            device_map="balanced",
+        logger.info(f"[model_loader] Loading {PipelineClass.__name__} from {load_source}...")
+        pipeline = PipelineClass.from_pretrained(
+            load_source,
+            torch_dtype=dtype,
+            token=hf_token,
         )
-        # Ensure everything is on the primary CUDA device.
-        pipeline = pipeline.to("cuda")
 
-        # Optional: enable memory-efficient attention if xFormers is available.
-        # xFormers gives ~10-15% speedup with no quality loss on Ampere+ GPUs.
-        try:
-            pipeline.enable_xformers_memory_efficient_attention()
-            logger.info("[model_loader] xFormers memory-efficient attention enabled.")
-        except Exception:
-            logger.warning(
-                "[model_loader] xFormers not available — using native SDPA attention."
-            )
+        # Device placement & VRAM optimization
+        if torch.cuda.is_available():
+            if total_vram_gb >= 70.0:
+                logger.info(
+                    f"[model_loader] High VRAM detected ({total_vram_gb:.1f} GB >= 70 GB). "
+                    "Placing entire pipeline in VRAM (cuda:0) for fastest execution."
+                )
+                pipeline = pipeline.to("cuda")
+            else:
+                logger.info(
+                    f"[model_loader] Standard VRAM detected ({total_vram_gb:.1f} GB < 70 GB). "
+                    "Enabling model CPU offload."
+                )
+                pipeline.enable_model_cpu_offload()
+
+            # Enable VAE tiling for memory-safe decoding of large videos/frames
+            if hasattr(pipeline, "vae") and hasattr(pipeline.vae, "enable_tiling"):
+                pipeline.vae.enable_tiling()
+                logger.info("[model_loader] VAE tiling enabled.")
+            if hasattr(pipeline, "diffusion_decoder") and hasattr(pipeline.diffusion_decoder, "enable_tiling"):
+                pipeline.diffusion_decoder.enable_tiling()
+                logger.info("[model_loader] Diffusion decoder tiling enabled.")
+
+        # Set eval mode
+        if hasattr(pipeline, "eval"):
+            pipeline.eval()
 
         _pipeline = pipeline
         elapsed = time.monotonic() - t0
-        logger.info(f"[model_loader] Pipeline ready in {elapsed:.1f}s.")
+        logger.info(f"[model_loader] Pipeline successfully loaded and ready in {elapsed:.1f}s.")
         return _pipeline
 
-    except torch.cuda.OutOfMemoryError as oom:
-        logger.error(f"[model_loader] CUDA OOM during model load: {oom}")
-        raise RuntimeError("out_of_memory_during_load") from oom
     except Exception as exc:
         logger.exception(f"[model_loader] Failed to load pipeline: {exc}")
-        raise
+        raise RuntimeError(f"Pipeline loading error: {exc}") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
+# Internal Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _assert_volume_mounted() -> None:
-    """Fail fast if the network volume isn't mounted."""
-    if not VOLUME_ROOT.exists():
-        raise EnvironmentError(
-            f"Runpod network volume not found at '{VOLUME_ROOT}'. "
-            "Ensure a network volume is attached and mounted at /runpod-volume "
-            "in the Runpod endpoint configuration."
-        )
-    # Confirm write access
-    test_file = VOLUME_ROOT / ".write_test"
+def _resolve_pipeline_class() -> Any:
+    """Resolve the appropriate Diffusers pipeline class for LTX-2.5."""
     try:
-        test_file.touch()
-        test_file.unlink()
-    except OSError as exc:
-        raise EnvironmentError(
-            f"Network volume at '{VOLUME_ROOT}' is not writable: {exc}"
-        ) from exc
+        from diffusers import LTX2Pipeline
+        logger.info("[model_loader] Using diffusers.LTX2Pipeline")
+        return LTX2Pipeline
+    except ImportError:
+        pass
+
+    try:
+        from diffusers import LTXVideoPipeline
+        logger.info("[model_loader] Using diffusers.LTXVideoPipeline")
+        return LTXVideoPipeline
+    except ImportError:
+        pass
+
+    try:
+        from diffusers import AutoPipelineForText2Video
+        logger.info("[model_loader] Using diffusers.AutoPipelineForText2Video")
+        return AutoPipelineForText2Video
+    except ImportError as e:
+        logger.error(f"[model_loader] Failed to import Diffusers pipeline: {e}")
+        raise ImportError("diffusers is required to run LTX-2.5.") from e
 
 
 def _missing_sentinel_files() -> list[str]:
-    """Return the list of expected sentinel files that are absent or zero-size."""
+    """Check which sentinel files are missing from the weights directory."""
     missing = []
     for rel_path in SENTINEL_FILES:
         full = WEIGHTS_DIR / rel_path
@@ -201,56 +229,40 @@ def _missing_sentinel_files() -> list[str]:
 
 
 def _download_weights() -> None:
-    """
-    Download all LTX-2.5 model files to the network volume.
-
-    Uses snapshot_download so that HF handles sharded files, retries,
-    and partial-download resumption transparently.
-
-    IMPORTANT: HF_TOKEN must be set in the environment (via Runpod secret)
-    because Lightricks/LTX-Video is a gated repository.
-    """
+    """Download model weights using snapshot_download."""
     hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        raise RuntimeError(
-            "HF_TOKEN environment variable is not set. "
-            "Add it as a Runpod secret and reference it in the endpoint env vars. "
-            "The token must have 'read access to gated repos' scope and you must "
-            "have accepted the model license at huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled"
-        )
-
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Enable hf_transfer for faster multipart downloads if installed.
-    # The ENV var is set in the Dockerfile; this is a belt-and-suspenders check.
     if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
-        logger.info("[model_loader] hf_transfer enabled for accelerated download.")
+        logger.info("[model_loader] HF Transfer acceleration active.")
 
-    logger.info(
-        f"[model_loader] Downloading '{HF_REPO_ID}' → '{WEIGHTS_DIR}' …\n"
-        "This only happens once on a fresh volume. Estimated download size: ~25–30 GB."
-    )
+    t0 = time.monotonic()
+    logger.info(f"[model_loader] Starting snapshot_download of '{MODEL_ID}' -> {WEIGHTS_DIR}")
 
-    snapshot_download(
-        repo_id=HF_REPO_ID,
-        repo_type="model",
-        local_dir=str(WEIGHTS_DIR),
-        local_dir_use_symlinks=False,  # store real files on the volume, not symlinks
-        token=hf_token,
-        ignore_patterns=[
-            "*.msgpack",       # Flax weights — not needed for PyTorch inference
-            "*.h5",            # Keras/TF weights
-            "flax_model*",
-            "tf_model*",
-            "rust_model*",
-            "*.ot",
-        ],
-    )
-
-    # Final sanity check: confirm sentinels are now present.
-    still_missing = _missing_sentinel_files()
-    if still_missing:
-        raise RuntimeError(
-            f"Download appeared to complete but sentinel files are still missing: "
-            f"{still_missing}. Check disk space on the network volume."
+    try:
+        snapshot_download(
+            repo_id=MODEL_ID,
+            repo_type="model",
+            local_dir=str(WEIGHTS_DIR),
+            local_dir_use_symlinks=False,
+            token=hf_token,
+            ignore_patterns=[
+                "*.msgpack",
+                "*.h5",
+                "flax_model*",
+                "tf_model*",
+                "rust_model*",
+                "*.ot",
+                "transformer_full/*",  # Exclude raw transformer_full unless requested to save disk
+            ],
         )
+        elapsed = time.monotonic() - t0
+        logger.info(f"[model_loader] Download completed in {elapsed:.1f}s.")
+    except Exception as exc:
+        logger.error(
+            f"[model_loader] Failed to download '{MODEL_ID}' from Hugging Face: {exc}\n"
+            "If this is a gated model, verify that:\n"
+            "1. You have requested and been granted access on https://huggingface.co/" + MODEL_ID + "\n"
+            "2. Your HF_TOKEN has 'read access to gated repos' permissions."
+        )
+        raise

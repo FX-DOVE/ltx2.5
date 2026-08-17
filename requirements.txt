@@ -2,38 +2,37 @@
 # LTX-2.5 Runpod Serverless – Python dependencies
 #
 # Base image: runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-# (CUDA 12.4.1 + PyTorch 2.4.0 + Python 3.11 + Ubuntu 22.04)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Runpod SDK ────────────────────────────────────────────────────────────────
-runpod>=1.7.3
+# ── Runpod Serverless SDK ───────────────────────────────────────────────────
+runpod>=1.7.7
 
-# ── Hugging Face tooling ──────────────────────────────────────────────────────
-huggingface_hub[cli]>=0.23.0
+# ── Hugging Face tooling & acceleration ──────────────────────────────────────
+huggingface_hub[cli]>=0.26.0
 hf_transfer>=0.1.8
 
-# ── Input validation ──────────────────────────────────────────────────────────
+# ── Input validation & Schemas ───────────────────────────────────────────────
 pydantic>=2.7.0
 
-# ── Image / video I/O ────────────────────────────────────────────────────────
+# ── Image / Video Processing ─────────────────────────────────────────────────
 Pillow>=10.3.0
 imageio[ffmpeg]>=2.34.0
 imageio-ffmpeg>=0.5.1
 
-# ── LTX-2.5 inference dependencies ───────────────────────────────────────────
-git+https://github.com/Lightricks/LTX-Video.git
-sentencepiece>=0.2.0
+# ── LTX-2.5 & Diffusers Dependencies ─────────────────────────────────────────
+git+https://github.com/huggingface/diffusers.git
 transformers>=4.48.0
-diffusers>=0.31.0
 accelerate>=0.33.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
 
-# ── Numerics ──────────────────────────────────────────────────────────────────
+# ── Numerics & Tensors ───────────────────────────────────────────────────────
 numpy>=1.26.0
 einops>=0.8.0
 
-# ── Utilities ────────────────────────────────────────────────────────────────
+# ── Storage & Utilities ──────────────────────────────────────────────────────
+boto3>=1.34.0
 requests>=2.32.0
 tqdm>=4.66.0
 loguru>=0.7.2
 python-dotenv>=1.0.0
-boto3>=1.34.0
