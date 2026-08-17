@@ -18,6 +18,26 @@ import os
 import sys
 import time
 from pathlib import Path
+
+# Force volume paths before any huggingface or tempfile imports
+VOLUME_ROOT = Path(os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume"))
+HF_CACHE_DIR = VOLUME_ROOT / "hf_cache"
+TMP_DIR = VOLUME_ROOT / "tmp"
+
+try:
+    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+os.environ["HF_HOME"] = str(HF_CACHE_DIR)
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(HF_CACHE_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR)
+os.environ["TMPDIR"] = str(TMP_DIR)
+os.environ["TEMP"] = str(TMP_DIR)
+os.environ["TMP"] = str(TMP_DIR)
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
 from typing import Any, Optional
 
 import torch

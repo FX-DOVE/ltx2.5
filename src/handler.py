@@ -18,11 +18,30 @@ Workflow:
 """
 from __future__ import annotations
 
-import base64
 import os
+from pathlib import Path
+
+# Configure volume paths before any other imports
+_VOL_ROOT = Path(os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume"))
+_HF_DIR = _VOL_ROOT / "hf_cache"
+_T_DIR = _VOL_ROOT / "tmp"
+
+try:
+    _HF_DIR.mkdir(parents=True, exist_ok=True)
+    _T_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+os.environ["HF_HOME"] = str(_HF_DIR)
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(_HF_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(_HF_DIR)
+os.environ["TMPDIR"] = str(_T_DIR)
+os.environ["TEMP"] = str(_T_DIR)
+os.environ["TMP"] = str(_T_DIR)
+
+import base64
 import tempfile
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
