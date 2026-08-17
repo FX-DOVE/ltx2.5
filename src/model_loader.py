@@ -36,7 +36,7 @@ os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR)
 os.environ["TMPDIR"] = str(TMP_DIR)
 os.environ["TEMP"] = str(TMP_DIR)
 os.environ["TMP"] = str(TMP_DIR)
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 from typing import Any, Optional
 
