@@ -259,24 +259,41 @@ def _missing_sentinel_files() -> list[str]:
 
 
 def _download_weights() -> None:
-    """Download model weights using snapshot_download."""
+    """Download model weights using single-copy snapshot_download with disk space safety."""
+    import shutil
+
     hf_token = os.environ.get("HF_TOKEN")
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Check and log volume disk space
+    try:
+        total, used, free = shutil.disk_usage(VOLUME_ROOT)
+        logger.info(
+            f"[model_loader] Storage status: {used/(1024**3):.1f}GB used / "
+            f"{free/(1024**3):.1f}GB free of {total/(1024**3):.1f}GB total."
+        )
+        # If less than 30GB free, clean up stale/temporary cache directories
+        if free < 30 * (1024**3):
+            logger.warning("[model_loader] Free disk space under 30GB. Cleaning stale cache & temp files...")
+            shutil.rmtree(TMP_DIR, ignore_errors=True)
+            shutil.rmtree(HF_CACHE_DIR, ignore_errors=True)
+            shutil.rmtree(WEIGHTS_DIR / ".cache", ignore_errors=True)
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"[model_loader] Could not check disk usage: {e}")
 
     if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
         logger.info("[model_loader] HF Transfer acceleration active.")
 
     t0 = time.monotonic()
-    logger.info(f"[model_loader] Starting snapshot_download of '{MODEL_ID}' -> {WEIGHTS_DIR}")
+    logger.info(f"[model_loader] Starting single-copy snapshot_download of '{MODEL_ID}' -> {WEIGHTS_DIR}")
 
     try:
-        HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         snapshot_download(
             repo_id=MODEL_ID,
             repo_type="model",
             local_dir=str(WEIGHTS_DIR),
-            cache_dir=str(HF_CACHE_DIR),
-            local_dir_use_symlinks=False,
             token=hf_token,
             max_workers=8,
             ignore_patterns=[
