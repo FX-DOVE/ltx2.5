@@ -123,12 +123,15 @@ def load_pipeline() -> Any:
     logger.info(f"[model_loader] Initializing LTX-2.5 Pipeline (dtype={dtype})...")
 
     # Determine load source
+    ensure_weights_present()
     if (WEIGHTS_DIR / "model_index.json").exists():
         load_source = str(WEIGHTS_DIR)
+        local_only = True
         logger.info(f"[model_loader] Loading from local volume path: {load_source}")
     else:
         load_source = MODEL_ID
-        logger.info(f"[model_loader] Local volume path empty or incomplete. Loading from HF repo: {load_source}")
+        local_only = False
+        logger.info(f"[model_loader] Local volume path empty. Loading from HF repo: {load_source}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -246,6 +249,7 @@ def _download_weights() -> None:
             local_dir=str(WEIGHTS_DIR),
             local_dir_use_symlinks=False,
             token=hf_token,
+            max_workers=8,
             ignore_patterns=[
                 "*.msgpack",
                 "*.h5",
@@ -253,7 +257,7 @@ def _download_weights() -> None:
                 "tf_model*",
                 "rust_model*",
                 "*.ot",
-                "transformer_full/*",  # Exclude raw transformer_full unless requested to save disk
+                "transformer_full/*",
             ],
         )
         elapsed = time.monotonic() - t0
