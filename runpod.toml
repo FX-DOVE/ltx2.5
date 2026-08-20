@@ -8,6 +8,9 @@
 #   • The Runpod API          (https://docs.runpod.io/serverless/references/api-reference)
 #   • runpodctl               (see README.md for deploy.sh example)
 #
+# GPU: NVIDIA L40S (48 GB VRAM)
+# Resolution: 450p (768×448) default, up to 720p
+# Max duration: 10 seconds (241 frames @ 24 fps)
 # Field explanations map to the Runpod console field names exactly.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -21,32 +24,32 @@ name = "ltx25-video-gen"
 container_image = "ghcr.io/fx-dove/ltx2.5:latest"
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
-# Primary: RTX PRO 6000 (96 GB GDDR7) — fits the full bfloat16 pipeline
-#          with headroom for 1080p generation.
-# Fallback: H100 SXM (80 GB HBM3) — can run up to 720p / 97 frames safely.
-#           1080p may OOM; reduce num_frames or resolution in that case.
-gpu_type_id = "NVIDIA RTX PRO 6000"   # Runpod GPU type string
-# fallback_gpu_type_id = "NVIDIA H100 80GB HBM3"   # uncomment to enable
+# Primary: NVIDIA L40S (48 GB GDDR6) — fits the full bfloat16 pipeline
+#          at 450p (768×448) with comfortable VRAM headroom.
+#          Estimated VRAM usage at 450p / 241 frames: ~28–35 GB.
+# Fallback: RTX 4090 (24 GB) — can run 450p but at reduced frame counts (≤ 97);
+#           set num_frames ≤ 97 in requests to avoid OOM.
+gpu_type_id = "NVIDIA L40S"   # Runpod GPU type string
+# fallback_gpu_type_id = "NVIDIA GeForce RTX 4090"   # uncomment to enable
 
 # ── Scaling ───────────────────────────────────────────────────────────────────
 # min_workers = 0  →  you pay NOTHING while idle.
 # Tradeoff: the first request after an idle period pays a cold-start penalty
-# (model load into VRAM, ~30–90 s depending on GPU). Every subsequent request
+# (model load into VRAM, ~30–60 s on L40S). Every subsequent request
 # on a warm worker is instantaneous from a loading perspective.
-# See README.md § Cost Notes for a detailed breakdown.
+# L40S is cheaper ($1.75/hr serverless) → can afford more max_workers.
 min_workers = 0
-max_workers = 2
+max_workers = 3
 
 # ── Timeouts ─────────────────────────────────────────────────────────────────
 # idle_timeout: seconds a warm worker stays alive with no jobs before shutting
 # down.  Lower = less idle billing; higher = fewer cold starts for bursty traffic.
-# 60 s is a reasonable default: covers small bursts without much idle cost.
 idle_timeout = 60          # seconds
 
 # execution_timeout: maximum wall-clock seconds allowed for a single job.
-# 1080p / 97 frames / 40 steps typically takes 90–180 s on an RTX PRO 6000.
-# Set this higher than your slowest expected generation to avoid false timeouts.
-execution_timeout = 300    # seconds (5 min)
+# 450p / 241 frames / 40 steps typically takes 40–90 s on an L40S.
+# Set comfortably above the slowest expected generation.
+execution_timeout = 180    # seconds (3 min)
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 # container_disk_size: ephemeral disk for the container's OS + pip cache.

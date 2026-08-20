@@ -2,6 +2,7 @@
 src/handler.py
 ─────────────────────────────────────────────────────────────────────────────
 Runpod Serverless entrypoint for the LTX-2.5 video generation model.
+Target GPU: NVIDIA L40S (48 GB VRAM).
 
 Cold-start sequence (executed once at module import time, before any request):
   1. Assert network volume is mounted at /runpod-volume.
@@ -108,7 +109,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     except RuntimeError as exc:
         err_str = str(exc)
         if "out_of_memory" in err_str:
-            logger.error(f"[handler] Job {job_id} → OOM.")
+            logger.error(f"[handler] Job {job_id} -> OOM.")
             return _error_response(
                 error_code="out_of_memory",
                 message=(
@@ -117,14 +118,14 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 ),
                 retryable=False,
             )
-        logger.exception(f"[handler] Job {job_id} → inference error: {exc}")
+        logger.exception(f"[handler] Job {job_id} -> inference error: {exc}")
         return _error_response(
             error_code="inference_error",
             message=err_str,
             retryable=False,
         )
     except Exception as exc:
-        logger.exception(f"[handler] Job {job_id} → unexpected error: {exc}")
+        logger.exception(f"[handler] Job {job_id} -> unexpected error: {exc}")
         return _error_response(
             error_code="internal_error",
             message=f"An unexpected error occurred: {type(exc).__name__}: {exc}",
@@ -137,7 +138,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     try:
         video_bytes = _encode_video(frames_uint8, fps=params.fps)
     except Exception as exc:
-        logger.exception(f"[handler] Job {job_id} → video encoding failed: {exc}")
+        logger.exception(f"[handler] Job {job_id} -> video encoding failed: {exc}")
         return _error_response(
             error_code="encoding_error",
             message=f"Video encoding failed: {exc}",
@@ -156,7 +157,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             video_url = _upload_video(video_bytes, job_id)
         except Exception as exc:
             logger.warning(
-                f"[handler] Job {job_id} → upload failed ({exc}), falling back to base64."
+                f"[handler] Job {job_id} -> upload failed ({exc}), falling back to base64."
             )
             video_b64 = base64.b64encode(video_bytes).decode("utf-8")
     else:

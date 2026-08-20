@@ -13,9 +13,10 @@ Supported modes:
   • image2video  — prompt + first frame conditioning image
   • flf2video    — prompt + first frame + last frame (First-Last-Frame)
 
-GPU memory notes (RTX PRO 6000, 96 GB VRAM):
-  • 720p / 97 frames / bfloat16 uses roughly 40–55 GB VRAM.
-  • 1080p / 97 frames requires 70–85 GB; it will OOM on GPUs < 80 GB.
+GPU memory notes (NVIDIA L40S, 48 GB VRAM):
+  • 450p (768×448) / 241 frames / bfloat16 uses roughly 28–35 GB VRAM — safe.
+  • 720p / 97 frames uses roughly 35–42 GB — fits with some headroom.
+  • 1080p / 97 frames requires 55–65 GB — will OOM on L40S; do not use.
   • The pipeline is kept in memory between requests (singleton in
     model_loader.py). torch.cuda.empty_cache() is called after each
     generation to return fragmented memory before the next request.

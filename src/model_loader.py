@@ -31,7 +31,7 @@ Design decisions worth noting:
     request that fragmented the allocator.
   • We load in bfloat16 (the native LTX-2.5 dtype). int8 quantisation is
     available via quanto but is not the default because it adds 2–3 minutes
-    to model load time with no measurable quality benefit at 96 GB VRAM.
+    to model load time with no measurable quality benefit at 48 GB VRAM.
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -49,20 +49,54 @@ from loguru import logger
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-VOLUME_ROOT = Path(os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume"))
-WEIGHTS_DIR = VOLUME_ROOT / "models" / "ltx-2.5"
-HF_REPO_ID = "Lightricks/LTX-Video-2-0-5B-Distilled"  # The public HF repo name
-# NOTE: If Lightricks releases a newer repo ID or renames, update this constant.
+VOLUME_PATH_OVERRIDE = os.environ.get("RUNPOD_VOLUME_PATH")
 
-# Sentinel files we check to confirm the download is complete.
-# Checking a file list is more robust than checking dir existence (a partial
-# download would leave the directory but miss some files).
+def get_volume_root() -> Path:
+    """Detect mounted network volume across Serverless (/runpod-volume) and Pods (/workspace)."""
+    if VOLUME_PATH_OVERRIDE:
+        return Path(VOLUME_PATH_OVERRIDE)
+    for candidate in [Path("/runpod-volume"), Path("/workspace")]:
+        if (candidate / "models" / "ltx-2.5").exists():
+            return candidate
+    for candidate in [Path("/runpod-volume"), Path("/workspace")]:
+        if candidate.exists():
+            return candidate
+    return Path("/runpod-volume")
+
+VOLUME_ROOT = get_volume_root()
+WEIGHTS_DIR = VOLUME_ROOT / "models" / "ltx-2.5"
+HF_REPO_ID = "Lightricks/LTX-2.5"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model file layout matching Lightricks/LTX-2.5 safetensors repository
+# ─────────────────────────────────────────────────────────────────────────────
+MODEL_FILES = {
+    # Transformers
+    "transformer_distilled_bf16": "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+    "transformer_distilled_int8": "diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+    "transformer_distilled_nvfp4": "diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
+    "transformer_dev_bf16": "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+    "transformer_dev_int8": "diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors",
+    # Text Encoders
+    "text_encoder_bf16": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+    "text_encoder_int8": "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+    # VAEs
+    "video_vae_bf16": "vae/ltx-2.5-video-vae-bf16.safetensors",
+    "audio_vae_bf16": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+    # Patches & Upscalers
+    "duration_head_bf16": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
+    "spatial_upscaler_bf16": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    "temporal_upscaler_bf16": "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors",
+    # LoRAs
+    "lora_distilled_bf16": "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
+}
+
+# Sentinel files required for standard LTX-2.5 inference
 SENTINEL_FILES = [
-    "transformer/config.json",
-    "vae/config.json",
-    "scheduler/scheduler_config.json",
-    "text_encoder/config.json",
-    "tokenizer/tokenizer.json",
+    MODEL_FILES["transformer_distilled_bf16"],
+    MODEL_FILES["text_encoder_bf16"],
+    MODEL_FILES["video_vae_bf16"],
+    MODEL_FILES["spatial_upscaler_bf16"],
 ]
 
 # Module-level pipeline singleton — loaded once per worker process.
@@ -113,8 +147,7 @@ def load_pipeline() -> object:
     Load LTX-2.5 into GPU memory and return the pipeline singleton.
 
     Subsequent calls return the cached singleton without reloading.
-    Thread-safety: Runpod workers are single-threaded per handler invocation,
-    so we don't need a lock here.
+    Supports both official ltx_pipelines (DistilledPipeline) and diffusers LTXVideoPipeline.
     """
     global _pipeline
 
@@ -123,28 +156,74 @@ def load_pipeline() -> object:
         return _pipeline
 
     t0 = time.monotonic()
-    logger.info(f"[model_loader] Loading LTX-2.5 pipeline from {WEIGHTS_DIR} …")
+    logger.info(f"[model_loader] Loading LTX-2.5 pipeline from {WEIGHTS_DIR} ...")
 
     # Free any lingering allocations before loading new model weights.
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     try:
-        # Deferred import: we only need this at load time, not at module import.
-        # This keeps startup fast if load_pipeline() is never called (e.g. in tests).
+        # First attempt: Official LTX-2.5 distilled / dev pipeline
+        try:
+            from ltx_pipelines.distilled import DistilledPipeline
+            from ltx_pipelines.utils.model_paths import ModelPaths
+            from ltx_core.model.video_vae.transformer import DiffVAEMode
+            from ltx_pipelines.utils.types import OffloadMode
+
+            # Prefer distilled bf16 on L40S (48GB), fallback to int8 or dev
+            transformer_path = WEIGHTS_DIR / MODEL_FILES["transformer_distilled_bf16"]
+            if not transformer_path.exists():
+                transformer_path = WEIGHTS_DIR / MODEL_FILES["transformer_distilled_int8"]
+            if not transformer_path.exists():
+                transformer_path = WEIGHTS_DIR / MODEL_FILES["transformer_dev_bf16"]
+
+            text_encoder_path = WEIGHTS_DIR / MODEL_FILES["text_encoder_bf16"]
+            if not text_encoder_path.exists():
+                text_encoder_path = WEIGHTS_DIR / MODEL_FILES["text_encoder_int8"]
+
+            video_vae_path = WEIGHTS_DIR / MODEL_FILES["video_vae_bf16"]
+            audio_vae_path = WEIGHTS_DIR / MODEL_FILES["audio_vae_bf16"]
+            duration_head_path = WEIGHTS_DIR / MODEL_FILES["duration_head_bf16"]
+            spatial_upscaler_path = WEIGHTS_DIR / MODEL_FILES["spatial_upscaler_bf16"]
+
+            model_paths = ModelPaths.from_split(
+                transformer_path=str(transformer_path),
+                text_encoder_path=str(text_encoder_path),
+                video_vae_path=str(video_vae_path),
+                audio_vae_path=str(audio_vae_path) if audio_vae_path.exists() else None,
+                duration_head_path=str(duration_head_path) if duration_head_path.exists() else None,
+            )
+
+            pipeline = DistilledPipeline(
+                model_paths=model_paths,
+                spatial_upsampler_path=str(spatial_upscaler_path) if spatial_upscaler_path.exists() else None,
+                loras=(),
+                device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                quantization=None,
+                compilation_config=None,
+                offload_mode=OffloadMode.NONE,
+                diffvae_optimization=DiffVAEMode.CHUNKED_EAGER,
+            )
+            logger.info("[model_loader] DistilledPipeline loaded successfully via ltx_pipelines.")
+            _pipeline = pipeline
+            elapsed = time.monotonic() - t0
+            logger.info(f"[model_loader] Pipeline ready in {elapsed:.1f}s.")
+            return _pipeline
+
+        except (ImportError, AttributeError) as exc:
+            logger.debug(f"[model_loader] ltx_pipelines not used ({exc}), falling back to diffusers LTXVideoPipeline.")
+
+        # Second attempt: diffusers LTXVideoPipeline
         from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline  # type: ignore
 
         pipeline = LTXVideoPipeline.from_pretrained(
             str(WEIGHTS_DIR),
             torch_dtype=torch.bfloat16,
-            # device_map="balanced" would split across GPUs; for a single GPU
-            # this is equivalent to moving everything to cuda:0.
             device_map="balanced",
         )
-        # Ensure everything is on the primary CUDA device.
-        pipeline = pipeline.to("cuda")
+        if torch.cuda.is_available():
+            pipeline = pipeline.to("cuda")
 
-        # Optional: enable memory-efficient attention if xFormers is available.
-        # xFormers gives ~10-15% speedup with no quality loss on Ampere+ GPUs.
         try:
             pipeline.enable_xformers_memory_efficient_attention()
             logger.info("[model_loader] xFormers memory-efficient attention enabled.")
@@ -176,8 +255,8 @@ def _assert_volume_mounted() -> None:
     if not VOLUME_ROOT.exists():
         raise EnvironmentError(
             f"Runpod network volume not found at '{VOLUME_ROOT}'. "
-            "Ensure a network volume is attached and mounted at /runpod-volume "
-            "in the Runpod endpoint configuration."
+            "Ensure a network volume is attached and mounted at /runpod-volume (or /workspace) "
+            "in the Runpod configuration."
         )
     # Confirm write access
     test_file = VOLUME_ROOT / ".write_test"
@@ -208,7 +287,7 @@ def _download_weights() -> None:
     and partial-download resumption transparently.
 
     IMPORTANT: HF_TOKEN must be set in the environment (via Runpod secret)
-    because Lightricks/LTX-Video is a gated repository.
+    because Lightricks/LTX-2.5 is a gated repository.
     """
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
@@ -216,30 +295,28 @@ def _download_weights() -> None:
             "HF_TOKEN environment variable is not set. "
             "Add it as a Runpod secret and reference it in the endpoint env vars. "
             "The token must have 'read access to gated repos' scope and you must "
-            "have accepted the model license at huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled"
+            "have accepted the model license at huggingface.co/Lightricks/LTX-2.5"
         )
 
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Enable hf_transfer for faster multipart downloads if installed.
-    # The ENV var is set in the Dockerfile; this is a belt-and-suspenders check.
     if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
         logger.info("[model_loader] hf_transfer enabled for accelerated download.")
 
     logger.info(
-        f"[model_loader] Downloading '{HF_REPO_ID}' → '{WEIGHTS_DIR}' …\n"
-        "This only happens once on a fresh volume. Estimated download size: ~25–30 GB."
+        f"[model_loader] Downloading '{HF_REPO_ID}' -> '{WEIGHTS_DIR}' ...\n"
+        "This only happens once on a fresh volume."
     )
 
     snapshot_download(
         repo_id=HF_REPO_ID,
         repo_type="model",
         local_dir=str(WEIGHTS_DIR),
-        local_dir_use_symlinks=False,  # store real files on the volume, not symlinks
+        local_dir_use_symlinks=False,
         token=hf_token,
         ignore_patterns=[
-            "*.msgpack",       # Flax weights — not needed for PyTorch inference
-            "*.h5",            # Keras/TF weights
+            "*.msgpack",
+            "*.h5",
             "flax_model*",
             "tf_model*",
             "rust_model*",

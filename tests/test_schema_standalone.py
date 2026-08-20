@@ -122,9 +122,12 @@ class TestDynamicModeAutoDetection(unittest.TestCase):
 class TestResolution(unittest.TestCase):
     """Resolution enum and pixel dimension map."""
 
-    def test_default_resolution_is_720p(self):
+    def test_default_resolution_is_450p(self):
         obj = InferenceInput(prompt="test")
-        self.assertEqual(obj.resolution, Resolution.r720p)
+        self.assertEqual(obj.resolution, Resolution.r450p)
+
+    def test_450p_dimensions(self):
+        self.assertEqual(RESOLUTION_MAP[Resolution.r450p], (768, 448))
 
     def test_480p_dimensions(self):
         self.assertEqual(RESOLUTION_MAP[Resolution.r480p], (848, 480))
@@ -136,7 +139,7 @@ class TestResolution(unittest.TestCase):
         self.assertEqual(RESOLUTION_MAP[Resolution.r1080p], (1920, 1080))
 
     def test_all_resolutions_accepted(self):
-        for res in ("480p", "720p", "1080p"):
+        for res in ("450p", "480p", "720p", "1080p"):
             with self.subTest(resolution=res):
                 obj = InferenceInput(prompt="test", resolution=res)
                 self.assertEqual(obj.resolution.value, res)
@@ -150,7 +153,7 @@ class TestNumFrames(unittest.TestCase):
     """LTX-2.5 frame count constraint: (N-1) must be divisible by 8."""
 
     VALID = [9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97,
-             121, 145, 161, 193, 225, 257]
+             121, 145, 161, 193, 225, 241, 257]
     INVALID = [8, 10, 11, 16, 18, 24, 26, 98, 100, 256, 258]
 
     def test_all_valid_frame_counts(self):
@@ -174,9 +177,9 @@ class TestNumFrames(unittest.TestCase):
         with self.assertRaises(ValidationError):
             InferenceInput(prompt="test", num_frames=999)
 
-    def test_default_is_97(self):
+    def test_default_is_241(self):
         obj = InferenceInput(prompt="test")
-        self.assertEqual(obj.num_frames, 97)
+        self.assertEqual(obj.num_frames, 241)
 
 
 class TestSamplingParams(unittest.TestCase):

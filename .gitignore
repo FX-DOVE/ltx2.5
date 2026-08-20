@@ -39,6 +39,8 @@ htmlcov/
 # ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+.agents/
+.cursor/
 *.swp
 *.swo
 *~

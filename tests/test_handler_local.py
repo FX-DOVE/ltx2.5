@@ -263,8 +263,8 @@ class TestSchema(unittest.TestCase):
     def test_minimal_valid_input(self):
         obj = self.InferenceInput(prompt="test prompt")
         self.assertEqual(obj.mode.value, "text2video")
-        self.assertEqual(obj.resolution.value, "720p")
-        self.assertEqual(obj.num_frames, 97)
+        self.assertEqual(obj.resolution.value, "450p")
+        self.assertEqual(obj.num_frames, 241)
         self.assertEqual(obj.fps, 24)
 
     def test_seed_accepted(self):

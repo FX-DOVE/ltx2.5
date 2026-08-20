@@ -9,9 +9,10 @@ Three generation modes are supported:
   • flf2video   – prompt + first frame + last frame images → video
          (First-Last-Frame conditioning, a key LTX-2.5 feature)
 
-All optional fields have sensible defaults that keep VRAM usage within the
-RTX PRO 6000 96 GB budget.  Documented per-field so callers know what to
-expect without reading inference.py.
+Default target GPU: NVIDIA L40S (48 GB VRAM).
+Default resolution: 450p (768×448) — fits comfortably in L40S VRAM.
+Max duration:       10 seconds at 24 fps = 241 frames.
+                    (241−1=240, 240÷8=30 ✅ satisfies LTX-2.5 constraint)
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -29,15 +30,16 @@ class GenerationMode(str, Enum):
 
 
 class Resolution(str, Enum):
-    # Common LTX-2.5 resolutions (width x height).
-    # Odd multiples of 32 accepted by the pipeline but not exposed here.
-    r480p = "480p"    # 848x480
-    r720p = "720p"    # 1280x720
-    r1080p = "1080p"  # 1920x1080 — requires plenty of VRAM, use with caution
+    # Common LTX-2.5 resolutions (width x height, both must be multiples of 32).
+    r450p = "450p"    # 768×448  — DEFAULT for L40S (48 GB); ~20–28 GB VRAM
+    r480p = "480p"    # 848×480  — slightly larger, still fits L40S
+    r720p = "720p"    # 1280×720 — comfortable on L40S for short clips
+    r1080p = "1080p"  # 1920×1080 — may OOM on L40S; use with caution
 
 
 # Pixel dimensions for each resolution token
 RESOLUTION_MAP: dict[Resolution, tuple[int, int]] = {
+    Resolution.r450p: (768, 448),
     Resolution.r480p: (848, 480),
     Resolution.r720p: (1280, 720),
     Resolution.r1080p: (1920, 1080),
@@ -48,6 +50,9 @@ class InferenceInput(BaseModel):
     """
     Validated input for a single generation request.
     All fields except `prompt` have defaults so callers can send minimal JSON.
+
+    Designed for NVIDIA L40S (48 GB VRAM) serverless endpoint.
+    Default resolution: 450p (768×448).  Max duration: 10 s (241 frames @ 24 fps).
     """
 
     # ── Required ──────────────────────────────────────────────────────────────
@@ -98,18 +103,23 @@ class InferenceInput(BaseModel):
 
     # ── Output dimensions ─────────────────────────────────────────────────────
     resolution: Resolution = Field(
-        default=Resolution.r720p,
-        description="Output video resolution.",
+        default=Resolution.r450p,
+        description=(
+            "Output video resolution. Default '450p' (768×448) is optimised for "
+            "the L40S 48 GB GPU. Use '480p' or '720p' for larger outputs."
+        ),
     )
 
     # ── Temporal settings ─────────────────────────────────────────────────────
+    # Max 10 seconds at 24 fps = 241 frames (241−1=240, 240÷8=30 ✅).
     num_frames: int = Field(
-        default=97,
+        default=241,
         ge=9,
         le=257,
         description=(
             "Number of frames to generate. LTX-2.5 requires (N-1) divisible by 8. "
-            "Values like 9, 17, 25, 33, ..., 97, 121, 145, 161, 193, 225, 257 are valid."
+            "Valid values: 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, ..., 241, 257. "
+            "Max 241-257 frames = ~10 s at 24 fps (L40S memory cap)."
         ),
     )
     fps: int = Field(
@@ -143,11 +153,11 @@ class InferenceInput(BaseModel):
     @field_validator("num_frames")
     @classmethod
     def frames_must_be_valid(cls, v: int) -> int:
-        """LTX-2.5 requires (num_frames - 1) % 8 == 0."""
+        """LTX-2.5 requires (num_frames - 1) % 8 == 0. Max 241 (10 s @ 24 fps)."""
         if (v - 1) % 8 != 0:
             raise ValueError(
                 f"num_frames={v} is invalid. (num_frames - 1) must be divisible by 8. "
-                f"Try one of: 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, …"
+                f"Try one of: 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, …, 241"
             )
         return v
 
