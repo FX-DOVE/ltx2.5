@@ -5,27 +5,19 @@ scripts/download_weights.py
 Standalone script to pre-populate the network volume with LTX-2.5 weights.
 
 Usage:
-  # On a Runpod pod attached to the same network volume:
-  python scripts/download_weights.py
-
-  # With an explicit token (if HF_TOKEN env var is not set):
+  # On a RunPod pod attached to the network volume:
   HF_TOKEN=hf_xxx python scripts/download_weights.py
 
-  # Override the default download directory:
-  RUNPOD_VOLUME_PATH=/my/volume python scripts/download_weights.py
-
-This script is also used internally by the handler on the very first cold
-start. Running it manually on a Pod (instead of a Serverless worker) lets
-you pre-populate the volume cheaply before the Serverless endpoint is live,
-avoiding the first-cold-start download penalty entirely.
+  # With custom model repo or volume path:
+  MODEL_ID=Lightricks/LTX-2.5-Diffusers RUNPOD_VOLUME_PATH=/runpod-volume python scripts/download_weights.py
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
-# Allow running from repo root without installing the package.
+# Allow running from repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from loguru import logger
@@ -33,19 +25,23 @@ import model_loader
 
 
 def main() -> None:
-    logger.info("=== LTX-2.5 Weight Download Script ===")
-    logger.info(f"Volume root : {model_loader.VOLUME_ROOT}")
-    logger.info(f"Weights dir : {model_loader.WEIGHTS_DIR}")
-    logger.info(f"HF repo     : {model_loader.HF_REPO_ID}")
+    logger.info("=== LTX-2.5 Weight Download & Verification ===")
+    logger.info(f"Model ID    : {model_loader.MODEL_ID}")
+    logger.info(f"Volume Root : {model_loader.VOLUME_ROOT}")
+    logger.info(f"Weights Dir : {model_loader.WEIGHTS_DIR}")
+
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        logger.warning(
+            "HF_TOKEN environment variable is not set. "
+            "If downloading a gated model, provide HF_TOKEN=hf_xxx."
+        )
 
     try:
         model_loader.ensure_weights_present()
-        logger.success("✓ Weights are present and ready on the network volume.")
-    except EnvironmentError as exc:
-        logger.error(f"Volume error: {exc}")
-        sys.exit(1)
-    except RuntimeError as exc:
-        logger.error(f"Download error: {exc}")
+        logger.success("Weights are downloaded and verified on the volume.")
+    except Exception as exc:
+        logger.error(f"Failed to prepare model weights: {exc}")
         sys.exit(1)
 
 
