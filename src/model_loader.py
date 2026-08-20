@@ -214,7 +214,10 @@ def load_pipeline() -> object:
             logger.debug(f"[model_loader] ltx_pipelines not used ({exc}), falling back to diffusers LTXVideoPipeline.")
 
         # Second attempt: diffusers LTXVideoPipeline
-        from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline  # type: ignore
+        try:
+            from diffusers import LTXVideoPipeline  # type: ignore
+        except ImportError:
+            from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline  # type: ignore
 
         pipeline = LTXVideoPipeline.from_pretrained(
             str(WEIGHTS_DIR),

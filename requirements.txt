@@ -26,6 +26,9 @@ accelerate>=0.33.0
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 
+# ── Lightricks LTX-Video (provides ltx_video package used by model_loader.py) ─
+git+https://github.com/Lightricks/LTX-Video.git
+
 # ── Numerics & Tensors ───────────────────────────────────────────────────────
 numpy>=1.26.0
 einops>=0.8.0
