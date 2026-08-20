@@ -25,10 +25,11 @@ import model_loader
 
 
 def main() -> None:
+    weights_dir = model_loader.get_weights_dir()
     logger.info("=== LTX-2.5 Weight Download & Verification ===")
-    logger.info(f"Model ID    : {model_loader.MODEL_ID}")
-    logger.info(f"Volume Root : {model_loader.VOLUME_ROOT}")
-    logger.info(f"Weights Dir : {model_loader.WEIGHTS_DIR}")
+    logger.info(f"Repo ID     : {model_loader.HF_REPO_ID}")
+    logger.info(f"Weights Dir : {weights_dir}")
+    logger.info(f"Volume Root : {weights_dir.parent.parent}")
 
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:

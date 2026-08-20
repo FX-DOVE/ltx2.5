@@ -55,7 +55,7 @@ def _make_job(input_dict: dict[str, Any]) -> dict[str, Any]:
 def _make_black_frames(t: int = 9, h: int = 480, w: int = 848) -> "np.ndarray":
     """Return a (T, H, W, 3) uint8 array of black frames for testing."""
     import numpy as np
-    return (np.zeros((t, h, w, 3), dtype=np.float32), 42)
+    return (np.zeros((t, h, w, 3), dtype=np.uint8), 42)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

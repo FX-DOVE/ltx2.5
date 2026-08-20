@@ -35,7 +35,7 @@ ENV MODEL_ID=Lightricks/LTX-2.5 \
     RUNPOD_VOLUME_PATH=/runpod-volume \
     HF_HOME=/runpod-volume/hf_cache \
     TRANSFORMERS_CACHE=/runpod-volume/hf_cache \
-    HF_HUB_ENABLE_HF_TRANSFER=0 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

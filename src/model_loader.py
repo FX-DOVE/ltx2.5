@@ -32,6 +32,8 @@ Design decisions worth noting:
   • We load in bfloat16 (the native LTX-2.5 dtype). int8 quantisation is
     available via quanto but is not the default because it adds 2–3 minutes
     to model load time with no measurable quality benefit at 48 GB VRAM.
+  • Model paths are resolved dynamically at runtime using get_weights_dir(),
+    which respects the MODEL_PATH environment variable if set.
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -49,22 +51,6 @@ from loguru import logger
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-VOLUME_PATH_OVERRIDE = os.environ.get("RUNPOD_VOLUME_PATH")
-
-def get_volume_root() -> Path:
-    """Detect mounted network volume across Serverless (/runpod-volume) and Pods (/workspace)."""
-    if VOLUME_PATH_OVERRIDE:
-        return Path(VOLUME_PATH_OVERRIDE)
-    for candidate in [Path("/runpod-volume"), Path("/workspace")]:
-        if (candidate / "models" / "ltx-2.5").exists():
-            return candidate
-    for candidate in [Path("/runpod-volume"), Path("/workspace")]:
-        if candidate.exists():
-            return candidate
-    return Path("/runpod-volume")
-
-VOLUME_ROOT = get_volume_root()
-WEIGHTS_DIR = VOLUME_ROOT / "models" / "ltx-2.5"
 HF_REPO_ID = "Lightricks/LTX-2.5"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +90,35 @@ _pipeline: Optional[object] = None  # type: ignore[assignment]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Path Resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_weights_dir() -> Path:
+    """
+    Determine the model storage path at runtime.
+    Priority:
+    1. MODEL_PATH env var (escape hatch)
+    2. RUNPOD_VOLUME_PATH env var (Runpod specific)
+    3. Default mounted paths (/runpod-volume, then /workspace)
+    """
+    if env_path := os.environ.get("MODEL_PATH"):
+        path = Path(env_path)
+    elif env_vol := os.environ.get("RUNPOD_VOLUME_PATH"):
+        path = Path(env_vol) / "models" / "ltx-2.5"
+    else:
+        # Auto-detect standard Runpod volume locations
+        for candidate in [Path("/runpod-volume"), Path("/workspace")]:
+            if (candidate / "models" / "ltx-2.5").exists():
+                path = candidate / "models" / "ltx-2.5"
+                break
+        else:
+            path = Path("/runpod-volume/models/ltx-2.5")
+    
+    logger.debug(f"[model_loader] Resolved weights directory to: {path}")
+    return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -114,30 +129,31 @@ def ensure_weights_present() -> None:
 
     Behaviour:
       • If all sentinel files exist on the volume → log and return immediately.
-      • Otherwise → download the full snapshot to WEIGHTS_DIR via HF Hub.
+      • Otherwise → download the full snapshot to the resolved weights directory.
 
     Raises:
       RuntimeError   if HF_TOKEN is missing or download fails.
       EnvironmentError if the network volume is not mounted / writable.
     """
-    _assert_volume_mounted()
+    weights_dir = get_weights_dir()
+    _assert_volume_writable(weights_dir.parent)
 
     t0 = time.monotonic()
-    missing = _missing_sentinel_files()
+    missing = _missing_sentinel_files(weights_dir)
 
     if not missing:
         elapsed = time.monotonic() - t0
         logger.info(
-            f"[model_loader] Weights already present on volume at {WEIGHTS_DIR} "
+            f"[model_loader] Weights already present at {weights_dir} "
             f"(checked in {elapsed:.2f}s) — skipping download."
         )
         return
 
     logger.info(
         f"[model_loader] Missing sentinel files: {missing}. "
-        f"Starting download from '{HF_REPO_ID}' → {WEIGHTS_DIR}"
+        f"Starting download from '{HF_REPO_ID}' → {weights_dir}"
     )
-    _download_weights()
+    _download_weights(weights_dir)
     elapsed = time.monotonic() - t0
     logger.info(f"[model_loader] Download complete in {elapsed:.1f}s.")
 
@@ -147,44 +163,41 @@ def load_pipeline() -> object:
     Load LTX-2.5 into GPU memory and return the pipeline singleton.
 
     Subsequent calls return the cached singleton without reloading.
-    Supports both official ltx_pipelines (DistilledPipeline) and diffusers LTXVideoPipeline.
     """
     global _pipeline
+    weights_dir = get_weights_dir()
 
     if _pipeline is not None:
         logger.debug("[model_loader] Pipeline already loaded — reusing singleton.")
         return _pipeline
 
     t0 = time.monotonic()
-    logger.info(f"[model_loader] Loading LTX-2.5 pipeline from {WEIGHTS_DIR} ...")
+    logger.info(f"[model_loader] Loading LTX-2.5 pipeline from {weights_dir} ...")
 
-    # Free any lingering allocations before loading new model weights.
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     try:
-        # First attempt: Official LTX-2.5 distilled / dev pipeline
         try:
             from ltx_pipelines.distilled import DistilledPipeline
             from ltx_pipelines.utils.model_paths import ModelPaths
             from ltx_core.model.video_vae.transformer import DiffVAEMode
             from ltx_pipelines.utils.types import OffloadMode
 
-            # Prefer distilled bf16 on L40S (48GB), fallback to int8 or dev
-            transformer_path = WEIGHTS_DIR / MODEL_FILES["transformer_distilled_bf16"]
+            transformer_path = weights_dir / MODEL_FILES["transformer_distilled_bf16"]
             if not transformer_path.exists():
-                transformer_path = WEIGHTS_DIR / MODEL_FILES["transformer_distilled_int8"]
+                transformer_path = weights_dir / MODEL_FILES["transformer_distilled_int8"]
             if not transformer_path.exists():
-                transformer_path = WEIGHTS_DIR / MODEL_FILES["transformer_dev_bf16"]
+                transformer_path = weights_dir / MODEL_FILES["transformer_dev_bf16"]
 
-            text_encoder_path = WEIGHTS_DIR / MODEL_FILES["text_encoder_bf16"]
+            text_encoder_path = weights_dir / MODEL_FILES["text_encoder_bf16"]
             if not text_encoder_path.exists():
-                text_encoder_path = WEIGHTS_DIR / MODEL_FILES["text_encoder_int8"]
+                text_encoder_path = weights_dir / MODEL_FILES["text_encoder_int8"]
 
-            video_vae_path = WEIGHTS_DIR / MODEL_FILES["video_vae_bf16"]
-            audio_vae_path = WEIGHTS_DIR / MODEL_FILES["audio_vae_bf16"]
-            duration_head_path = WEIGHTS_DIR / MODEL_FILES["duration_head_bf16"]
-            spatial_upscaler_path = WEIGHTS_DIR / MODEL_FILES["spatial_upscaler_bf16"]
+            video_vae_path = weights_dir / MODEL_FILES["video_vae_bf16"]
+            audio_vae_path = weights_dir / MODEL_FILES["audio_vae_bf16"]
+            duration_head_path = weights_dir / MODEL_FILES["duration_head_bf16"]
+            spatial_upscaler_path = weights_dir / MODEL_FILES["spatial_upscaler_bf16"]
 
             model_paths = ModelPaths.from_split(
                 transformer_path=str(transformer_path),
@@ -204,23 +217,22 @@ def load_pipeline() -> object:
                 offload_mode=OffloadMode.NONE,
                 diffvae_optimization=DiffVAEMode.CHUNKED_EAGER,
             )
-            logger.info("[model_loader] DistilledPipeline loaded successfully via ltx_pipelines.")
+            logger.info("[model_loader] DistilledPipeline loaded successfully.")
             _pipeline = pipeline
             elapsed = time.monotonic() - t0
             logger.info(f"[model_loader] Pipeline ready in {elapsed:.1f}s.")
             return _pipeline
 
         except (ImportError, AttributeError) as exc:
-            logger.debug(f"[model_loader] ltx_pipelines not used ({exc}), falling back to diffusers LTXVideoPipeline.")
+            logger.debug(f"[model_loader] ltx_pipelines fallback: {exc}")
 
-        # Second attempt: diffusers LTXVideoPipeline
         try:
             from diffusers import LTXVideoPipeline  # type: ignore
         except ImportError:
             from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline  # type: ignore
 
         pipeline = LTXVideoPipeline.from_pretrained(
-            str(WEIGHTS_DIR),
+            str(weights_dir),
             torch_dtype=torch.bfloat16,
             device_map="balanced",
         )
@@ -253,36 +265,33 @@ def load_pipeline() -> object:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _assert_volume_mounted() -> None:
-    """Fail fast if the network volume isn't mounted."""
-    if not VOLUME_ROOT.exists():
-        raise EnvironmentError(
-            f"Runpod network volume not found at '{VOLUME_ROOT}'. "
-            "Ensure a network volume is attached and mounted at /runpod-volume (or /workspace) "
-            "in the Runpod configuration."
-        )
-    # Confirm write access
-    test_file = VOLUME_ROOT / ".write_test"
+def _assert_volume_writable(parent_dir: Path) -> None:
+    """Confirm the base directory is accessible and writable."""
+    if not parent_dir.exists():
+        try:
+            parent_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise EnvironmentError(f"Cannot create base directory {parent_dir}: {exc}")
+            
+    test_file = parent_dir / ".write_test"
     try:
         test_file.touch()
         test_file.unlink()
     except OSError as exc:
-        raise EnvironmentError(
-            f"Network volume at '{VOLUME_ROOT}' is not writable: {exc}"
-        ) from exc
+        raise EnvironmentError(f"Directory '{parent_dir}' is not writable: {exc}") from exc
 
 
-def _missing_sentinel_files() -> list[str]:
+def _missing_sentinel_files(weights_dir: Path) -> list[str]:
     """Return the list of expected sentinel files that are absent or zero-size."""
     missing = []
     for rel_path in SENTINEL_FILES:
-        full = WEIGHTS_DIR / rel_path
+        full = weights_dir / rel_path
         if not full.exists() or full.stat().st_size == 0:
             missing.append(rel_path)
     return missing
 
 
-def _download_weights() -> None:
+def _download_weights(weights_dir: Path) -> None:
     """
     Download all LTX-2.5 model files to the network volume.
 
@@ -301,20 +310,20 @@ def _download_weights() -> None:
             "have accepted the model license at huggingface.co/Lightricks/LTX-2.5"
         )
 
-    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    weights_dir.mkdir(parents=True, exist_ok=True)
 
     if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
         logger.info("[model_loader] hf_transfer enabled for accelerated download.")
 
     logger.info(
-        f"[model_loader] Downloading '{HF_REPO_ID}' -> '{WEIGHTS_DIR}' ...\n"
+        f"[model_loader] Downloading '{HF_REPO_ID}' -> '{weights_dir}' ...\n"
         "This only happens once on a fresh volume."
     )
 
     snapshot_download(
         repo_id=HF_REPO_ID,
         repo_type="model",
-        local_dir=str(WEIGHTS_DIR),
+        local_dir=str(weights_dir),
         local_dir_use_symlinks=False,
         token=hf_token,
         ignore_patterns=[
@@ -328,7 +337,7 @@ def _download_weights() -> None:
     )
 
     # Final sanity check: confirm sentinels are now present.
-    still_missing = _missing_sentinel_files()
+    still_missing = _missing_sentinel_files(weights_dir)
     if still_missing:
         raise RuntimeError(
             f"Download appeared to complete but sentinel files are still missing: "

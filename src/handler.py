@@ -114,7 +114,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 error_code="out_of_memory",
                 message=(
                     "CUDA out of memory. Try reducing resolution, num_frames, or "
-                    "num_inference_steps. 1080p with 97+ frames can exceed 96 GB VRAM."
+                    "num_inference_steps. The L40S has 48 GB VRAM; "
+                    "450p/241f uses ~30 GB, 720p/97f uses ~42 GB, 1080p will OOM."
                 ),
                 retryable=False,
             )
@@ -122,6 +123,14 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         return _error_response(
             error_code="inference_error",
             message=err_str,
+            retryable=False,
+        )
+    except ValueError as exc:
+        # Image decode errors raised by inference._decode_image
+        logger.warning(f"[handler] Job {job_id} -> image decode error: {exc}")
+        return _error_response(
+            error_code="image_decode_error",
+            message=str(exc),
             retryable=False,
         )
     except Exception as exc:
@@ -196,25 +205,32 @@ def _encode_video(frames: np.ndarray, fps: int) -> bytes:
     """
     Encode a (T, H, W, 3) uint8 numpy array to an H.264 MP4 bytestring.
 
-    Uses imageio with the ffmpeg backend.  The output is a libx264 encoded
-    MP4 suitable for direct playback in browsers and mobile apps.
+    Uses imageio v3 with the ffmpeg backend (imageio-ffmpeg).  Output is
+    libx264 / yuv420p — the most widely compatible format for web/mobile.
     """
-    import imageio  # deferred to keep import time fast for test mocks
+    import imageio.v3 as iio  # v3 API — avoids deprecation warnings from mimwrite
+
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(
+            f"Expected frames shape (T, H, W, 3), got {frames.shape}."
+        )
+    if frames.dtype != np.uint8:
+        raise ValueError(
+            f"Expected uint8 frames, got dtype={frames.dtype}."
+        )
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = tmp.name
 
     try:
-        # quality=8 → high quality; crf=18 equivalent.
-        # ffmpeg_params override lets us set the pixel format explicitly —
-        # yuv420p is the most compatible format for web/mobile playback.
-        imageio.mimwrite(
+        iio.imwrite(
             tmp_path,
-            frames,
+            frames,                # (T, H, W, 3) uint8
+            plugin="FFMPEG",
             fps=fps,
-            quality=8,
-            ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
-            macro_block_size=None,
+            codec="libx264",       # explicit codec — avoids mpeg4 fallback
+            pixelformat="yuv420p", # broadest browser/mobile compatibility
+            output_params=["-crf", "18", "-movflags", "+faststart"],
         )
         video_bytes = Path(tmp_path).read_bytes()
     finally:
@@ -245,6 +261,12 @@ def _upload_video(video_bytes: bytes, job_id: str) -> str:
 
 def _upload_to_runpod_storage(video_bytes: bytes, job_id: str) -> str:
     """Upload to Runpod's built-in temporary S3 storage and return the URL."""
+    if not hasattr(runpod, "upload_file"):
+        raise RuntimeError(
+            "runpod.upload_file is not available in this SDK version. "
+            "Upgrade to runpod>=1.7.7 or configure S3_BUCKET for external storage."
+        )
+
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name

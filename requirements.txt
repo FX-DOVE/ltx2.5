@@ -2,6 +2,7 @@
 # LTX-2.5 Runpod Serverless – Python dependencies
 #
 # Base image: runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+# (torch, torchvision, torchaudio, cuda already bundled in the base image)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Runpod Serverless SDK ───────────────────────────────────────────────────
@@ -19,15 +20,27 @@ Pillow>=10.3.0
 imageio[ffmpeg]>=2.34.0
 imageio-ffmpeg>=0.5.1
 
-# ── LTX-2.5 & Diffusers Dependencies ─────────────────────────────────────────
+# ── LTX-2.5 Diffusers Stack ───────────────────────────────────────────────────
+# Bleeding-edge diffusers is required for LTXVideoPipeline + LTXVideoCondition.
 git+https://github.com/huggingface/diffusers.git
 transformers>=4.48.0
 accelerate>=0.33.0
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 
-# ── Lightricks LTX-Video (provides ltx_video package used by model_loader.py) ─
+# ── Lightricks LTX-2.5 official packages ─────────────────────────────────────
+# ltx_pipelines / ltx_core — primary pipeline used by model_loader.py.
+# Provides: DistilledPipeline, ModelPaths, DiffVAEMode, OffloadMode.
+git+https://github.com/Lightricks/LTX-Video.git#subdirectory=ltx_pipelines
+
+# ltx_video — fallback pipeline (LTXVideoPipeline from the older API).
+# Used when ltx_pipelines is not available (ImportError path in model_loader.py).
 git+https://github.com/Lightricks/LTX-Video.git
+
+# ── Attention optimisation (optional but recommended on L40S) ─────────────────
+# xformers provides memory-efficient attention for the diffusers fallback path.
+# Skipped gracefully by model_loader.py if not installed.
+xformers>=0.0.27
 
 # ── Numerics & Tensors ───────────────────────────────────────────────────────
 numpy>=1.26.0
@@ -38,4 +51,3 @@ boto3>=1.34.0
 requests>=2.32.0
 tqdm>=4.66.0
 loguru>=0.7.2
-python-dotenv>=1.0.0

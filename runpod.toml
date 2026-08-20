@@ -86,3 +86,17 @@ PRESIGNED_URL_TTL_SECONDS = "86400"   # 24 hours
 # These are already set in the Dockerfile; listed here for documentation.
 HF_HUB_ENABLE_HF_TRANSFER = "1"
 PYTHONUNBUFFERED = "1"
+
+# ── Model path resolution (optional overrides) ────────────────────────────────
+# The handler discovers models via this priority waterfall:
+#   1. MODEL_PATH env var        → use this exact directory as the weights dir
+#   2. RUNPOD_VOLUME_PATH env var → weights_dir = <value>/models/ltx-2.5
+#   3. Auto-detect /runpod-volume/models/ltx-2.5  (RunPod Serverless default)
+#   4. Auto-detect /workspace/models/ltx-2.5      (RunPod Pod / Vast.ai)
+#
+# For this endpoint the network volume (scr3boo7r9) mounts at /runpod-volume
+# and models live at /runpod-volume/models/ltx-2.5.  No overrides are needed
+# — auto-detection handles it.  Uncomment below ONLY if you change the layout.
+#
+# RUNPOD_VOLUME_PATH = "/runpod-volume"
+# MODEL_PATH = "/runpod-volume/models/ltx-2.5"
