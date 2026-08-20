@@ -29,13 +29,13 @@ RUN pip install --upgrade pip setuptools wheel && \
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 
-ENV MODEL_ID=Lightricks/LTX-2.5-Diffusers \
+ENV MODEL_ID=Lightricks/LTX-2.5 \
     DTYPE=bfloat16 \
     GPU_MEMORY_UTILIZATION=0.95 \
     RUNPOD_VOLUME_PATH=/runpod-volume \
-    HF_HOME=/runpod-volume/.cache/huggingface \
-    TRANSFORMERS_CACHE=/runpod-volume/.cache/huggingface/transformers \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HOME=/runpod-volume/hf_cache \
+    TRANSFORMERS_CACHE=/runpod-volume/hf_cache \
+    HF_HUB_ENABLE_HF_TRANSFER=0 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

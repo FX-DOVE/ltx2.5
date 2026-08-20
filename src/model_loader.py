@@ -37,37 +37,16 @@ Design decisions worth noting:
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
-
-# Force volume paths before any huggingface or tempfile imports
-VOLUME_ROOT = Path(os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume"))
-HF_CACHE_DIR = VOLUME_ROOT / "hf_cache"
-TMP_DIR = VOLUME_ROOT / "tmp"
-
-try:
-    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
-
-os.environ["HF_HOME"] = str(HF_CACHE_DIR)
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(HF_CACHE_DIR)
-os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR)
-os.environ["TMPDIR"] = str(TMP_DIR)
-os.environ["TEMP"] = str(TMP_DIR)
-os.environ["TMP"] = str(TMP_DIR)
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 from huggingface_hub import snapshot_download
 from loguru import logger
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration & Constants
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 VOLUME_PATH_OVERRIDE = os.environ.get("RUNPOD_VOLUME_PATH")
@@ -120,18 +99,8 @@ SENTINEL_FILES = [
     MODEL_FILES["spatial_upscaler_bf16"],
 ]
 
-# Torch dtype map
-DTYPE_MAP = {
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-    "float16": torch.float16,
-    "fp16": torch.float16,
-    "float32": torch.float32,
-    "fp32": torch.float32,
-}
-
-# Module-level pipeline singleton
-_pipeline: Optional[Any] = None
+# Module-level pipeline singleton — loaded once per worker process.
+_pipeline: Optional[object] = None  # type: ignore[assignment]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,46 +108,41 @@ _pipeline: Optional[Any] = None
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_torch_dtype() -> torch.dtype:
-    """Return the configured torch dtype (default bfloat16)."""
-    return DTYPE_MAP.get(DTYPE_STR, torch.bfloat16)
-
-
 def ensure_weights_present() -> None:
     """
-    Check if the model checkpoint exists on the network volume.
-    If not, download the snapshot from Hugging Face.
+    Idempotent weight-availability check.  Safe to call on every cold start.
+
+    Behaviour:
+      • If all sentinel files exist on the volume → log and return immediately.
+      • Otherwise → download the full snapshot to WEIGHTS_DIR via HF Hub.
+
+    Raises:
+      RuntimeError   if HF_TOKEN is missing or download fails.
+      EnvironmentError if the network volume is not mounted / writable.
     """
-    logger.info(f"[model_loader] Checking weights for '{MODEL_ID}' on volume at {WEIGHTS_DIR}")
-    
-    if not VOLUME_ROOT.exists():
-        logger.warning(
-            f"[model_loader] Volume root '{VOLUME_ROOT}' is not mounted. "
-            "Will attempt direct loading / downloading to default cache if local storage allows."
+    _assert_volume_mounted()
+
+    t0 = time.monotonic()
+    missing = _missing_sentinel_files()
+
+    if not missing:
+        elapsed = time.monotonic() - t0
+        logger.info(
+            f"[model_loader] Weights already present on volume at {WEIGHTS_DIR} "
+            f"(checked in {elapsed:.2f}s) — skipping download."
         )
         return
 
-    # Check volume write permission
-    try:
-        test_file = VOLUME_ROOT / ".write_test"
-        test_file.touch()
-        test_file.unlink()
-    except OSError as exc:
-        logger.warning(f"[model_loader] Volume root '{VOLUME_ROOT}' write test failed: {exc}")
-
-    missing = _missing_sentinel_files()
-    if not missing:
-        logger.info(f"[model_loader] All sentinel files present at {WEIGHTS_DIR} - skipping download.")
-        return
-
     logger.info(
-        f"[model_loader] Missing components: {missing}. "
-        f"Downloading '{MODEL_ID}' to {WEIGHTS_DIR}..."
+        f"[model_loader] Missing sentinel files: {missing}. "
+        f"Starting download from '{HF_REPO_ID}' → {WEIGHTS_DIR}"
     )
     _download_weights()
+    elapsed = time.monotonic() - t0
+    logger.info(f"[model_loader] Download complete in {elapsed:.1f}s.")
 
 
-def load_pipeline() -> Any:
+def load_pipeline() -> object:
     """
     Load LTX-2.5 into GPU memory and return the pipeline singleton.
 
@@ -188,7 +152,7 @@ def load_pipeline() -> Any:
     global _pipeline
 
     if _pipeline is not None:
-        logger.debug("[model_loader] Pipeline already loaded - returning cached singleton.")
+        logger.debug("[model_loader] Pipeline already loaded — reusing singleton.")
         return _pipeline
 
     t0 = time.monotonic()
@@ -270,16 +234,19 @@ def load_pipeline() -> Any:
 
         _pipeline = pipeline
         elapsed = time.monotonic() - t0
-        logger.info(f"[model_loader] Pipeline successfully loaded and ready in {elapsed:.1f}s.")
+        logger.info(f"[model_loader] Pipeline ready in {elapsed:.1f}s.")
         return _pipeline
 
+    except torch.cuda.OutOfMemoryError as oom:
+        logger.error(f"[model_loader] CUDA OOM during model load: {oom}")
+        raise RuntimeError("out_of_memory_during_load") from oom
     except Exception as exc:
         logger.exception(f"[model_loader] Failed to load pipeline: {exc}")
-        raise RuntimeError(f"Pipeline loading error: {exc}") from exc
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal Helpers
+# Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -294,30 +261,16 @@ def _assert_volume_mounted() -> None:
     # Confirm write access
     test_file = VOLUME_ROOT / ".write_test"
     try:
-        from diffusers import LTX2Pipeline
-        logger.info("[model_loader] Using diffusers.LTX2Pipeline")
-        return LTX2Pipeline
-    except ImportError:
-        pass
-
-    try:
-        from diffusers import LTXVideoPipeline
-        logger.info("[model_loader] Using diffusers.LTXVideoPipeline")
-        return LTXVideoPipeline
-    except ImportError:
-        pass
-
-    try:
-        from diffusers import AutoPipelineForText2Video
-        logger.info("[model_loader] Using diffusers.AutoPipelineForText2Video")
-        return AutoPipelineForText2Video
-    except ImportError as e:
-        logger.error(f"[model_loader] Failed to import Diffusers pipeline: {e}")
-        raise ImportError("diffusers is required to run LTX-2.5.") from e
+        test_file.touch()
+        test_file.unlink()
+    except OSError as exc:
+        raise EnvironmentError(
+            f"Network volume at '{VOLUME_ROOT}' is not writable: {exc}"
+        ) from exc
 
 
 def _missing_sentinel_files() -> list[str]:
-    """Check which sentinel files are missing from the weights directory."""
+    """Return the list of expected sentinel files that are absent or zero-size."""
     missing = []
     for rel_path in SENTINEL_FILES:
         full = WEIGHTS_DIR / rel_path
@@ -327,8 +280,8 @@ def _missing_sentinel_files() -> list[str]:
 
 
 def _download_weights() -> None:
-    """Download model weights using single-copy snapshot_download with disk space safety."""
-    import shutil
+    """
+    Download all LTX-2.5 model files to the network volume.
 
     Uses snapshot_download so that HF handles sharded files, retries,
     and partial-download resumption transparently.
@@ -378,47 +331,3 @@ def _download_weights() -> None:
             f"Download appeared to complete but sentinel files are still missing: "
             f"{still_missing}. Check disk space on the network volume."
         )
-        # If less than 30GB free, clean up stale/temporary cache directories
-        if free < 30 * (1024**3):
-            logger.warning("[model_loader] Free disk space under 30GB. Cleaning stale cache & temp files...")
-            shutil.rmtree(TMP_DIR, ignore_errors=True)
-            shutil.rmtree(HF_CACHE_DIR, ignore_errors=True)
-            shutil.rmtree(WEIGHTS_DIR / ".cache", ignore_errors=True)
-            TMP_DIR.mkdir(parents=True, exist_ok=True)
-            HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.warning(f"[model_loader] Could not check disk usage: {e}")
-
-    if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
-        logger.info("[model_loader] HF Transfer acceleration active.")
-
-    t0 = time.monotonic()
-    logger.info(f"[model_loader] Starting single-copy snapshot_download of '{MODEL_ID}' -> {WEIGHTS_DIR}")
-
-    try:
-        snapshot_download(
-            repo_id=MODEL_ID,
-            repo_type="model",
-            local_dir=str(WEIGHTS_DIR),
-            token=hf_token,
-            max_workers=8,
-            ignore_patterns=[
-                "*.msgpack",
-                "*.h5",
-                "flax_model*",
-                "tf_model*",
-                "rust_model*",
-                "*.ot",
-                "transformer_full/*",
-            ],
-        )
-        elapsed = time.monotonic() - t0
-        logger.info(f"[model_loader] Download completed in {elapsed:.1f}s.")
-    except Exception as exc:
-        logger.error(
-            f"[model_loader] Failed to download '{MODEL_ID}' from Hugging Face: {exc}\n"
-            "If this is a gated model, verify that:\n"
-            "1. You have requested and been granted access on https://huggingface.co/" + MODEL_ID + "\n"
-            "2. Your HF_TOKEN has 'read access to gated repos' permissions."
-        )
-        raise
