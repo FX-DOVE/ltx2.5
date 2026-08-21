@@ -24,6 +24,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The runpod/pytorch base image is ~10.5 GB compressed / ~22 GB extracted,
+      # which alone exceeds the free space on a stock ubuntu-latest runner. Drop
+      # the preinstalled toolchains we never use so the pull + pip layers fit.
+      - name: Free up disk space
+        run: |
+          before=$(df -h / | tail -1)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          docker system prune -af >/dev/null 2>&1 || true
+          after=$(df -h / | tail -1)
+          echo "::notice title=Disk space::before: ${before} %0Aafter:  ${after}"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
