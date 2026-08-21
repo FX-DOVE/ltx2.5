@@ -29,10 +29,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 
-# The base image ships cryptography 41.0.7 installed by apt (no pip RECORD),
-# which blocks pip from upgrading it. Force-remove the system copy first.
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install --force-reinstall --no-deps --no-cache-dir cryptography && \
+# The base image ships cryptography 41.0.7 via apt (no pip RECORD file).
+# pip cannot uninstall it, so we strip it with apt before pip install.
+RUN apt-get update && apt-get remove -y python3-cryptography && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
 # Fail the build (not the first cold start) if the LTX packages did not land.
