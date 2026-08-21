@@ -30,19 +30,30 @@ class GenerationMode(str, Enum):
 
 
 class Resolution(str, Enum):
-    # Common LTX-2.5 resolutions (width x height, both must be multiples of 32).
-    r450p = "450p"    # 768×448  — DEFAULT for L40S (48 GB); ~20–28 GB VRAM
-    r480p = "480p"    # 848×480  — slightly larger, still fits L40S
-    r720p = "720p"    # 1280×720 — comfortable on L40S for short clips
-    r1080p = "1080p"  # 1920×1080 — may OOM on L40S; use with caution
+    """
+    LTX-2.5 resolution tokens.
+
+    The DistilledPipeline is a TWO-STAGE pipeline: stage 1 renders at half
+    resolution and stage 2 upsamples ×2.  Upstream `assert_resolution(h, w,
+    is_two_stage=True)` therefore requires BOTH width and height to be
+    divisible by 64 — not 32.  The previous values (848×480, 1280×720,
+    1920×1080) all failed that check and raised before a single step ran.
+    """
+
+    r450p = "450p"    # 768×448   — DEFAULT for L40S (48 GB)
+    r480p = "480p"    # 896×512   — nearest legal size to 848×480
+    r576p = "576p"    # 1024×576  — mid-size 16:9
+    r720p = "720p"    # 1280×704  — comfortable on L40S for short clips
+    r1080p = "1080p"  # 1920×1088 — upstream's own "1080p" HQ preset
 
 
-# Pixel dimensions for each resolution token
+# Pixel dimensions for each resolution token — (width, height), both %64 == 0.
 RESOLUTION_MAP: dict[Resolution, tuple[int, int]] = {
     Resolution.r450p: (768, 448),
-    Resolution.r480p: (848, 480),
-    Resolution.r720p: (1280, 720),
-    Resolution.r1080p: (1920, 1080),
+    Resolution.r480p: (896, 512),
+    Resolution.r576p: (1024, 576),
+    Resolution.r720p: (1280, 704),
+    Resolution.r1080p: (1920, 1088),
 }
 
 
@@ -91,6 +102,9 @@ class InferenceInput(BaseModel):
     )
 
     # ── Negative prompt ───────────────────────────────────────────────────────
+    # NOTE: the distilled LTX-2.5 pipeline is guidance-distilled and has no
+    # negative-prompt branch. Kept for API compatibility; it does not affect
+    # the output.
     negative_prompt: str = Field(
         default=(
             "low quality, worst quality, deformed, distorted, disfigured, "
@@ -98,7 +112,10 @@ class InferenceInput(BaseModel):
             "weird hand, ugly"
         ),
         max_length=500,
-        description="Negative conditioning text.",
+        description=(
+            "ACCEPTED BUT IGNORED. The distilled checkpoint has no negative "
+            "conditioning branch."
+        ),
     )
 
     # ── Output dimensions ─────────────────────────────────────────────────────
@@ -106,7 +123,8 @@ class InferenceInput(BaseModel):
         default=Resolution.r450p,
         description=(
             "Output video resolution. Default '450p' (768×448) is optimised for "
-            "the L40S 48 GB GPU. Use '480p' or '720p' for larger outputs."
+            "the L40S 48 GB GPU. '480p'=896×512, '576p'=1024×576, "
+            "'720p'=1280×704, '1080p'=1920×1088."
         ),
     )
 
@@ -130,17 +148,38 @@ class InferenceInput(BaseModel):
     )
 
     # ── Sampling settings ─────────────────────────────────────────────────────
+    # NOTE: the distilled LTX-2.5 checkpoint uses BAKED-IN sigma schedules —
+    # 8 steps in stage 1 and 3 steps in stage 2 — and is guidance-distilled, so
+    # it takes no CFG scale.  `num_inference_steps` and `guidance_scale` are
+    # accepted for backwards compatibility with existing callers but have NO
+    # effect on the output.  They are echoed back in the response for clarity.
     num_inference_steps: int = Field(
         default=40,
         ge=10,
         le=100,
-        description="Diffusion denoising steps. 40 is the recommended default.",
+        description=(
+            "ACCEPTED BUT IGNORED. The distilled checkpoint uses a fixed "
+            "8-step (stage 1) + 3-step (stage 2) sigma schedule."
+        ),
     )
     guidance_scale: float = Field(
         default=3.5,
         ge=1.0,
         le=10.0,
-        description="Classifier-free guidance scale.",
+        description=(
+            "ACCEPTED BUT IGNORED. The distilled checkpoint is "
+            "guidance-distilled and does not run classifier-free guidance."
+        ),
+    )
+    conditioning_strength: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "How strongly the conditioning image(s) constrain the result. "
+            "1.0 pins the frame exactly; lower values allow more deviation. "
+            "Ignored in text2video mode."
+        ),
     )
     seed: Optional[int] = Field(
         default=None,
@@ -206,6 +245,10 @@ class InferenceOutput(BaseModel):
     resolution: str
     num_frames: int
     fps: int
+    has_audio: bool = Field(
+        default=False,
+        description="True when LTX-2.5 generated an audio track that was muxed into the MP4.",
+    )
 
 
 class ErrorOutput(BaseModel):

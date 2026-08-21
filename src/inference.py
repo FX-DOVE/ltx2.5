@@ -1,39 +1,57 @@
 """
 src/inference.py
 ─────────────────────────────────────────────────────────────────────────────
-Inference wrapper for the LTX-2.5 pipeline.
+Inference wrapper for the LTX-2.5 `DistilledPipeline`.
 
-This module is deliberately kept thin — it translates the validated
-InferenceInput schema into pipeline kwargs and returns raw output (a tensor
-of frames).  All I/O (image decoding, video encoding, upload) lives in
-handler.py so this file stays easily testable in isolation.
+This module translates the validated InferenceInput schema into the exact
+call signature of `ltx_pipelines.distilled.DistilledPipeline.__call__`:
 
-Supported modes:
-  • text2video   — prompt only
-  • image2video  — prompt + first frame conditioning image
-  • flf2video    — prompt + first frame + last frame (First-Last-Frame)
+    pipeline(
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        frame_rate: float,
+        images: list[ImageConditioningInput],
+        num_frames: int | AutoDuration = DEFAULT_AUTO_DURATION,
+        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
+        ...
+    ) -> tuple[Iterator[torch.Tensor], Audio, int, TilingConfig | None]
 
-Pipeline backends
-─────────────────
-model_loader.py may load one of two pipeline types:
+Notes on what the pipeline does NOT accept
+──────────────────────────────────────────
+The distilled checkpoint is guidance-distilled with a baked-in sigma schedule
+(8 steps in stage 1, 3 in stage 2), so there is no `negative_prompt`,
+`num_inference_steps` or `guidance_scale` kwarg. Passing them raises
+TypeError. The schema still accepts those fields for API compatibility; they
+are ignored here.
 
-  1. DistilledPipeline (ltx_pipelines) — primary backend.
-     • Uses seed (int), NOT a torch.Generator.
-     • No output_type kwarg — always returns a tensor/list.
-     • FLF uses first_frame / last_frame kwargs, not LTXVideoCondition.
+Conditioning
+────────────
+`ImageConditioningInput` takes a *filesystem path*, not a PIL image, so
+decoded images are written to temporary files for the duration of the call.
+Per upstream `combined_image_conditionings()`:
+  • frame_idx == 0  → replacing latent (the frame is pinned as frame 0)
+  • frame_idx  > 0  → guiding keyframe (used for first-last-frame conditioning)
 
-  2. LTXVideoPipeline (diffusers) — fallback backend.
-     • Uses generator (torch.Generator).
-     • output_type="np" returns float32 numpy frames [0, 1].
-     • FLF uses LTXVideoCondition list.
+Resolution
+──────────
+`height`/`width` are the FINAL output size. The pipeline renders stage 1 at
+half of it and upsamples ×2, so upstream `assert_resolution(..., is_two_stage
+=True)` requires both to be divisible by 64. See schema.RESOLUTION_MAP.
 
-run_inference() detects the backend via _is_ltx_distilled_pipeline() and
-dispatches to the correct call helper.
+Output
+──────
+run_inference() returns the raw pipeline result (a lazily-decoded chunk
+iterator plus the audio track), NOT decoded frames — the caller hands it
+straight to `ltx_pipelines.utils.media_io.encode_video`, which streams chunks
+into libx264 and muxes the audio. Materialising frames as a numpy array would
+defeat the chunked decoder and roughly double peak host memory.
 
-GPU memory notes (NVIDIA L40S, 48 GB VRAM):
-  • 450p (768×448) / 241 frames / bfloat16 uses roughly 28–35 GB VRAM — safe.
-  • 720p / 97 frames uses roughly 35–42 GB — fits with some headroom.
-  • 1080p / 97 frames requires 55–65 GB — will OOM on L40S; do not use.
+GPU memory notes (NVIDIA L40S, 48 GB VRAM, fp8-cast quantization):
+  • 450p (768×448) / 241 frames — comfortable.
+  • 720p (1280×704) / 121 frames — fits with the chunked DiffVAE decoder.
+  • 1080p (1920×1088) — only with short clips; prefer LTX_OFFLOAD_MODE=cpu.
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -41,10 +59,13 @@ from __future__ import annotations
 import base64
 import io
 import random
+import shutil
+import tempfile
 import time
-from typing import Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator, Optional
 
-import numpy as np
 import torch
 from loguru import logger
 from PIL import Image, UnidentifiedImageError
@@ -52,38 +73,36 @@ from PIL import Image, UnidentifiedImageError
 from schema import RESOLUTION_MAP, GenerationMode, InferenceInput
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline-type helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _is_ltx_distilled_pipeline(pipeline: object) -> bool:
+@dataclass
+class InferenceResult:
     """
-    Return True when the loaded pipeline is a DistilledPipeline from the
-    ltx_pipelines package (Lightricks' first-party API).
+    Everything the encoder needs, in the order `encode_video` wants it.
 
-    We detect this by module prefix so we don't require the package to be
-    importable just to check the type.
+    Attributes:
+        video:  Iterator of (F, H, W, C) float [0, 1] RGB chunks from the VAE.
+        audio:  Generated audio track (waveform + sampling_rate), or None.
+        num_frames: Frame count actually generated (the duration head may pick
+            this when the caller does not).
+        tiling_config: Tiling actually used, needed for the chunk count.
+        seed: The seed that was used.
+        width / height: Final output dimensions.
     """
-    module = type(pipeline).__module__ or ""
-    return module.startswith("ltx_pipelines") or module.startswith("ltx_core")
 
+    video: Iterator[torch.Tensor]
+    audio: Any
+    num_frames: int
+    tiling_config: Any
+    seed: int
+    width: int
+    height: int
+    # Temp dir holding conditioning images; the caller must call cleanup()
+    # after encoding finishes (the frame iterator is lazy).
+    _tmpdir: Optional[str] = None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lazy import helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _get_ltx_condition_cls():
-    """
-    Return LTXVideoCondition from diffusers (deferred import).
-
-    Used only for the diffusers backend in flf2video mode.
-    """
-    try:
-        from diffusers.pipelines.ltx.pipeline_ltx_video import LTXVideoCondition  # type: ignore
-        return LTXVideoCondition
-    except ImportError:
-        from diffusers import LTXVideoCondition  # type: ignore
-        return LTXVideoCondition
+    def cleanup(self) -> None:
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,251 +110,128 @@ def _get_ltx_condition_cls():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def run_inference(
-    pipeline: object,
-    params: InferenceInput,
-) -> tuple[np.ndarray, int]:
+def run_inference(pipeline: object, params: InferenceInput) -> InferenceResult:
     """
-    Run LTX-2.5 inference and return (frames_uint8, seed_used).
-
-    Dispatches to the correct call helper based on the loaded pipeline backend.
+    Run LTX-2.5 inference.
 
     Returns:
-        frames_uint8: uint8 numpy array of shape (T, H, W, 3).
-        seed_used:    The integer seed that was actually used.
+        InferenceResult — the lazy frame iterator, audio track, resolved frame
+        count and tiling config, ready to hand to encode_video().
+
+    Raises:
+        RuntimeError("out_of_memory") on CUDA OOM.
+        ValueError on unusable conditioning images.
     """
+    from ltx_core.model.video_vae import AUTO_TILING
+    from ltx_pipelines.utils.args import ImageConditioningInput
+
     seed = params.seed if params.seed is not None else random.randint(0, 2**31 - 1)
     width, height = RESOLUTION_MAP[params.resolution]
 
     logger.info(
-        f"[inference] Starting {params.mode.value} | "
-        f"{width}x{height} | {params.num_frames} frames | "
-        f"steps={params.num_inference_steps} | cfg={params.guidance_scale} | seed={seed}"
+        f"[inference] {params.mode.value} | {width}x{height} | "
+        f"{params.num_frames} frames @ {params.fps} fps | seed={seed}"
     )
 
-    # Decode conditioning images (may raise ValueError on bad data — caught in handler)
-    first_pil: Optional[Image.Image] = None
-    last_pil: Optional[Image.Image] = None
+    # ── Conditioning images ──────────────────────────────────────────────────
+    # ImageConditioningInput wants a path, so decoded images are staged on disk.
+    tmpdir: Optional[str] = None
+    images: list = []
 
     if params.mode in (GenerationMode.image2video, GenerationMode.flf2video):
-        first_pil = _decode_image(params.first_frame_image, label="first_frame_image")  # type: ignore[arg-type]
-    if params.mode == GenerationMode.flf2video:
-        last_pil = _decode_image(params.last_frame_image, label="last_frame_image")    # type: ignore[arg-type]
+        tmpdir = tempfile.mkdtemp(prefix="ltx-cond-")
+        try:
+            first_path = _stage_image(
+                params.first_frame_image, Path(tmpdir) / "first.png", "first_frame_image"
+            )
+            images.append(
+                ImageConditioningInput(
+                    path=str(first_path),
+                    frame_idx=0,  # frame 0 → replacing latent
+                    strength=params.conditioning_strength,
+                )
+            )
+            if params.mode == GenerationMode.flf2video:
+                last_path = _stage_image(
+                    params.last_frame_image,
+                    Path(tmpdir) / "last.png",
+                    "last_frame_image",
+                )
+                images.append(
+                    ImageConditioningInput(
+                        path=str(last_path),
+                        # >0 → guiding keyframe. The last generated frame.
+                        frame_idx=params.num_frames - 1,
+                        strength=params.conditioning_strength,
+                    )
+                )
+        except Exception:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
 
+    # ── Generate ─────────────────────────────────────────────────────────────
     t0 = time.monotonic()
     try:
-        if _is_ltx_distilled_pipeline(pipeline):
-            frames = _run_ltx_distilled(pipeline, params, seed, width, height, first_pil, last_pil)
-        else:
-            frames = _run_diffusers(pipeline, params, seed, width, height, first_pil, last_pil)
+        video, audio, num_frames, tiling_config = pipeline(  # type: ignore[operator]
+            prompt=params.prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            frame_rate=float(params.fps),
+            images=images,
+            num_frames=params.num_frames,
+            tiling_config=AUTO_TILING,
+        )
     except torch.cuda.OutOfMemoryError as oom:  # type: ignore[attr-defined]
+        _discard(tmpdir)
         torch.cuda.empty_cache()
         logger.error(f"[inference] CUDA OOM: {oom}")
         raise RuntimeError("out_of_memory") from oom
-    except RuntimeError as exc:
-        torch.cuda.empty_cache()
-        # Re-raise OOM that was already wrapped (e.g. from model_loader)
-        if "out_of_memory" in str(exc):
-            raise
-        logger.exception(f"[inference] RuntimeError during generation: {exc}")
-        raise
     except Exception as exc:
+        _discard(tmpdir)
         torch.cuda.empty_cache()
-        logger.exception(f"[inference] Unexpected error during generation: {exc}")
+        if isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+            logger.error(f"[inference] CUDA OOM: {exc}")
+            raise RuntimeError("out_of_memory") from exc
+        logger.exception(f"[inference] Generation failed: {exc}")
         raise
 
-    elapsed = time.monotonic() - t0
-    logger.info(f"[inference] Completed in {elapsed:.1f}s.")
+    # Note: `video` is a lazy iterator — the diffusion work above is done, but
+    # VAE decode happens as the encoder pulls chunks.
+    logger.info(
+        f"[inference] Denoising complete in {time.monotonic() - t0:.1f}s "
+        f"({num_frames} frames). Decode streams during encode."
+    )
 
-    # Normalise to uint8 (T, H, W, 3).
-    frames_uint8 = _to_uint8(frames)
-
-    # Validate output shape before handing off to encoder.
-    if frames_uint8.ndim != 4 or frames_uint8.shape[-1] != 3:
-        raise RuntimeError(
-            f"Pipeline returned unexpected frame shape {frames_uint8.shape}. "
-            "Expected (T, H, W, 3)."
-        )
-    if frames_uint8.shape[0] == 0:
-        raise RuntimeError("Pipeline returned 0 frames.")
-
-    # Release VRAM before the next request.
-    torch.cuda.empty_cache()
-
-    return frames_uint8, seed
+    return InferenceResult(
+        video=video,
+        audio=audio,
+        num_frames=num_frames,
+        tiling_config=tiling_config,
+        seed=seed,
+        width=width,
+        height=height,
+        _tmpdir=tmpdir,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backend-specific call helpers
+# Image staging / decoding helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _run_ltx_distilled(
-    pipeline: object,
-    params: InferenceInput,
-    seed: int,
-    width: int,
-    height: int,
-    first_pil: Optional[Image.Image],
-    last_pil: Optional[Image.Image],
-) -> np.ndarray:
-    """
-    Call a Lightricks DistilledPipeline (ltx_pipelines backend).
-
-    Key differences from diffusers:
-      • seed is an int, not a torch.Generator.
-      • No output_type kwarg.
-      • FLF conditioning via first_frame / last_frame kwargs.
-      • Output is a tensor or list — normalised by _to_uint8().
-    """
-    kwargs: dict = {
-        "prompt": params.prompt,
-        "negative_prompt": params.negative_prompt,
-        "width": width,
-        "height": height,
-        "num_frames": params.num_frames,
-        "num_inference_steps": params.num_inference_steps,
-        "guidance_scale": params.guidance_scale,
-        "seed": seed,
-    }
-
-    if params.mode == GenerationMode.image2video:
-        kwargs["first_frame"] = first_pil
-    elif params.mode == GenerationMode.flf2video:
-        kwargs["first_frame"] = first_pil
-        kwargs["last_frame"] = last_pil
-
-    result = pipeline(**kwargs)  # type: ignore[operator]
-    return _extract_frames(result)
+def _discard(tmpdir: Optional[str]) -> None:
+    """Remove a staging directory if one was created."""
+    if tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _run_diffusers(
-    pipeline: object,
-    params: InferenceInput,
-    seed: int,
-    width: int,
-    height: int,
-    first_pil: Optional[Image.Image],
-    last_pil: Optional[Image.Image],
-) -> np.ndarray:
-    """
-    Call a diffusers LTXVideoPipeline.
-
-    Key differences from DistilledPipeline:
-      • Uses torch.Generator (device-aware, not hardcoded to cuda).
-      • output_type="np" → float32 frames in [0, 1].
-      • FLF via LTXVideoCondition list.
-    """
-    # Use the correct device for the generator — crashes on CPU if hardcoded to "cuda".
-    gen_device = "cuda" if torch.cuda.is_available() else "cpu"
-    generator = torch.Generator(device=gen_device).manual_seed(seed)
-
-    kwargs: dict = {
-        "prompt": params.prompt,
-        "negative_prompt": params.negative_prompt,
-        "width": width,
-        "height": height,
-        "num_frames": params.num_frames,
-        "num_inference_steps": params.num_inference_steps,
-        "guidance_scale": params.guidance_scale,
-        "generator": generator,
-        "output_type": "np",  # float32 [0, 1] numpy array
-    }
-
-    if params.mode == GenerationMode.image2video:
-        logger.debug("[inference] diffusers: image2video — image kwarg set.")
-        kwargs["image"] = first_pil
-
-    elif params.mode == GenerationMode.flf2video:
-        logger.debug(
-            "[inference] diffusers: flf2video — building LTXVideoCondition list "
-            "for frame 0 and frame %d.", params.num_frames - 1
-        )
-        LTXVideoCondition = _get_ltx_condition_cls()
-        kwargs["conditions"] = [
-            LTXVideoCondition(image=first_pil, frame_index=0, strength=1.0),
-            LTXVideoCondition(image=last_pil, frame_index=params.num_frames - 1, strength=1.0),
-        ]
-        # Some diffusers builds also expect `image` as the seed frame.
-        kwargs["image"] = first_pil
-
-    result = pipeline(**kwargs)  # type: ignore[operator]
-    return _extract_frames(result)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Output normalisation helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _extract_frames(result: object) -> np.ndarray:
-    """
-    Extract a (T, H, W, 3) numpy array from whatever the pipeline returned.
-
-    Handles all observed output formats:
-      • result.frames[0]  — diffusers standard (batch → first item)
-      • result.frames     — some builds return the array directly
-      • result[0]         — list/tuple of per-batch outputs
-      • result            — raw tensor or array
-    """
-    # diffusers: PipelineOutput with .frames attr
-    if hasattr(result, "frames"):
-        frames = result.frames
-        # frames may be (B, T, H, W, 3) or (T, H, W, 3)
-        if isinstance(frames, (list, tuple)):
-            frames = frames[0]  # first batch item
-        elif hasattr(frames, "shape") and frames.ndim == 5:
-            frames = frames[0]  # index into batch dim
-        return _to_numpy(frames)
-
-    # DistilledPipeline / list output
-    if isinstance(result, (list, tuple)):
-        return _to_numpy(result[0])
-
-    # Raw tensor or array
-    raw = _to_numpy(result)
-    if raw.ndim == 5:
-        raw = raw[0]  # strip batch dim
-    return raw
-
-
-def _to_numpy(x: object) -> np.ndarray:
-    """Convert tensor / list / ndarray to a numpy array."""
-    if isinstance(x, np.ndarray):
-        return x
-    if hasattr(x, "cpu"):  # torch.Tensor
-        x = x.cpu()
-    if hasattr(x, "numpy"):
-        return x.numpy()  # type: ignore[union-attr]
-    if isinstance(x, list):
-        return np.array(x)
-    raise TypeError(f"Cannot convert {type(x).__name__} to numpy array.")
-
-
-def _to_uint8(frames: np.ndarray) -> np.ndarray:
-    """
-    Normalise frames to uint8 (T, H, W, 3) regardless of input dtype/range.
-
-      • float32 / float16 in [0, 1]  → scale × 255
-      • float32 in [0, 255]           → clip and cast (shouldn't happen, but safe)
-      • uint8 already                 → return as-is
-    """
-    if frames.dtype == np.uint8:
-        return frames
-    if np.issubdtype(frames.dtype, np.floating):
-        if frames.max() <= 1.0 + 1e-3:
-            # Standard [0, 1] float output
-            return (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
-        else:
-            # Rare: float already in [0, 255] range
-            return np.clip(frames, 0, 255).astype(np.uint8)
-    # Integer types other than uint8
-    return frames.astype(np.uint8)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Image decoding helper
-# ─────────────────────────────────────────────────────────────────────────────
+def _stage_image(source: str, dest: Path, label: str) -> Path:
+    """Decode a conditioning image and write it to `dest` as PNG."""
+    img = _decode_image(source, label=label)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    img.save(dest, format="PNG")
+    return dest
 
 
 def _decode_image(source: str, label: str = "image") -> Image.Image:
@@ -363,9 +259,7 @@ def _decode_image(source: str, label: str = "image") -> Image.Image:
                     f"{label}: HTTP {http_err.response.status_code} fetching '{source}'."
                 )
             except requests.exceptions.RequestException as req_err:
-                raise ValueError(
-                    f"{label}: Failed to fetch '{source}': {req_err}"
-                )
+                raise ValueError(f"{label}: Failed to fetch '{source}': {req_err}")
             try:
                 img = Image.open(io.BytesIO(response.content))
             except UnidentifiedImageError:
@@ -380,9 +274,7 @@ def _decode_image(source: str, label: str = "image") -> Image.Image:
             try:
                 img_bytes = base64.b64decode(source, validate=True)
             except Exception:
-                raise ValueError(
-                    f"{label}: Invalid base64 string — could not decode."
-                )
+                raise ValueError(f"{label}: Invalid base64 string — could not decode.")
             try:
                 img = Image.open(io.BytesIO(img_bytes))
             except UnidentifiedImageError:

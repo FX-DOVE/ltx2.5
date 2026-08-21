@@ -13,25 +13,26 @@ Responsibilities
    huggingface_hub snapshot_download.
 
 2. load_pipeline()
-   Loads all model components (VAE, text encoder, transformer, scheduler)
-   into GPU memory and returns a ready-to-call LTXVideoPipeline. This is
-   called once per worker lifetime and the result is kept warm in a module-
-   level singleton.
+   Builds the Lightricks `DistilledPipeline` from the split ("Comfy-aligned")
+   checkpoint layout on the volume — one .safetensors per component, wired
+   through ModelPaths.from_split() — and returns it. This is called once per
+   worker lifetime and the result is kept warm in a module-level singleton.
 
 Design decisions worth noting:
-  • We use snapshot_download with local_dir=WEIGHTS_DIR and
-    local_dir_use_symlinks=False so that the real files live on the volume
-    and are not just symlinks into the HF cache. This is critical because
-    the HF_HOME cache directory is also on the volume — if both pointed at
-    the same location we'd get double storage usage.
+  • We use snapshot_download with local_dir=WEIGHTS_DIR so the real files live
+    on the volume rather than as symlinks into the HF cache. This is critical
+    because HF_HOME is also on the volume — if both pointed at the same
+    location we'd get double storage usage.
+  • Only the files needed for distilled inference are downloaded
+    (REQUIRED_FILES); pulling the full repo would exceed the volume.
   • Weight existence is checked by verifying individual sentinel files
     (not just the directory) to guard against partial downloads.
   • torch.cuda.empty_cache() is called before model load to maximise
     available VRAM — this matters if the handler process survived a previous
     request that fragmented the allocator.
-  • We load in bfloat16 (the native LTX-2.5 dtype). int8 quantisation is
-    available via quanto but is not the default because it adds 2–3 minutes
-    to model load time with no measurable quality benefit at 48 GB VRAM.
+  • We load in bfloat16 (the native LTX-2.5 dtype). Quantisation defaults to
+    fp8-cast (see LTX_QUANTIZATION below) because the raw bf16 transformer is
+    39.1 GB — too close to the 48 GB L40S limit for reliable two-stage decode.
   • Model paths are resolved dynamically at runtime using get_weights_dir(),
     which respects the MODEL_PATH environment variable if set.
 ─────────────────────────────────────────────────────────────────────────────
@@ -57,33 +58,51 @@ HF_REPO_ID = "Lightricks/LTX-2.5"
 # Model file layout matching Lightricks/LTX-2.5 safetensors repository
 # ─────────────────────────────────────────────────────────────────────────────
 MODEL_FILES = {
-    # Transformers
+    # ── Transformers (DiT) ───────────────────────────────────────────────────
+    # Only the bf16 checkpoints are loadable by ltx-pipelines / PyTorch.
+    # The *-comfy-int8-convrot files are ComfyUI-only (per the model card) and
+    # are deliberately NOT used as fallbacks here.
     "transformer_distilled_bf16": "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
-    "transformer_distilled_int8": "diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
     "transformer_distilled_nvfp4": "diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
     "transformer_dev_bf16": "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors",
+    # ComfyUI-only — listed so we can detect them and emit a clear error.
+    "transformer_distilled_int8": "diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
     "transformer_dev_int8": "diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors",
-    # Text Encoders
+    # ── Text encoders (Gemma-4 12B + LTX projections) ────────────────────────
     "text_encoder_bf16": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+    # ComfyUI-only.
     "text_encoder_int8": "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
-    # VAEs
-    "video_vae_bf16": "vae/ltx-2.5-video-vae-bf16.safetensors",
-    "audio_vae_bf16": "vae/ltx-2.5-audio-vae-bf16.safetensors",
-    # Patches & Upscalers
+    # ── VAEs ─────────────────────────────────────────────────────────────────
+    "video_vae_bf16": "vae/ltx-2.5-video-vae-bf16.safetensors",           # DiffVAE: higher quality, heavier
+    "video_vae_conv_bf16": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",  # Conv VAE: faster, lighter
+    "audio_vae_bf16": "vae/ltx-2.5-audio-vae-bf16.safetensors",           # audio VAE + vocoder
+    # ── Patches & upscalers ──────────────────────────────────────────────────
     "duration_head_bf16": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
     "spatial_upscaler_bf16": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
     "temporal_upscaler_bf16": "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors",
-    # LoRAs
+    # ── LoRAs ────────────────────────────────────────────────────────────────
     "lora_distilled_bf16": "loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
 }
 
-# Sentinel files required for standard LTX-2.5 inference
-SENTINEL_FILES = [
+# ComfyUI-only checkpoints, keyed so _require_first can explain the failure.
+COMFY_ONLY_KEYS = frozenset(
+    {"transformer_distilled_int8", "transformer_dev_int8", "text_encoder_int8"}
+)
+
+# The minimal set of files needed for distilled text/image-to-video inference.
+# Used as `allow_patterns` so a fresh volume does not pull all 185 GB of
+# variants (bf16 + int8 + nvfp4 + dev + temporal upscaler + LoRA).
+REQUIRED_FILES = [
     MODEL_FILES["transformer_distilled_bf16"],
     MODEL_FILES["text_encoder_bf16"],
     MODEL_FILES["video_vae_bf16"],
+    MODEL_FILES["audio_vae_bf16"],
+    MODEL_FILES["duration_head_bf16"],
     MODEL_FILES["spatial_upscaler_bf16"],
 ]
+
+# Sentinel files required for standard LTX-2.5 distilled inference.
+SENTINEL_FILES = list(REQUIRED_FILES)
 
 # Module-level pipeline singleton — loaded once per worker process.
 _pipeline: Optional[object] = None  # type: ignore[assignment]
@@ -163,12 +182,21 @@ def load_pipeline() -> object:
     Load LTX-2.5 into GPU memory and return the pipeline singleton.
 
     Subsequent calls return the cached singleton without reloading.
+
+    Configuration (all optional, read from the environment):
+      LTX_TRANSFORMER   distilled | distilled-nvfp4 | dev   (default: distilled)
+      LTX_QUANTIZATION  none | fp8-cast | fp8-scaled-mm |
+                        nvfp4-cast | nvfp4-prequant          (default: fp8-cast)
+      LTX_OFFLOAD_MODE  none | cpu | disk                    (default: none)
+      LTX_DIFFVAE_MODE  chunked_eager | chunked_compile |
+                        combined_compile | blackwell_dsl      (default: chunked_eager)
+      LTX_VIDEO_VAE     auto | diffusion | conv               (default: auto)
     """
     global _pipeline
     weights_dir = get_weights_dir()
 
     if _pipeline is not None:
-        logger.debug("[model_loader] Pipeline already loaded — reusing singleton.")
+        logger.debug("[model_loader] Pipeline already loaded - reusing singleton.")
         return _pipeline
 
     t0 = time.monotonic()
@@ -177,79 +205,90 @@ def load_pipeline() -> object:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    from ltx_core.model.video_vae.transformer import DiffVAEMode
+    from ltx_pipelines.distilled import DistilledPipeline
+    from ltx_pipelines.utils.model_paths import ModelPaths
+    from ltx_pipelines.utils.quantization_factory import QuantizationKind
+    from ltx_pipelines.utils.types import OffloadMode
+
     try:
-        try:
-            from ltx_pipelines.distilled import DistilledPipeline
-            from ltx_pipelines.utils.model_paths import ModelPaths
-            from ltx_core.model.video_vae.transformer import DiffVAEMode
-            from ltx_pipelines.utils.types import OffloadMode
-
-            transformer_path = weights_dir / MODEL_FILES["transformer_distilled_bf16"]
-            if not transformer_path.exists():
-                transformer_path = weights_dir / MODEL_FILES["transformer_distilled_int8"]
-            if not transformer_path.exists():
-                transformer_path = weights_dir / MODEL_FILES["transformer_dev_bf16"]
-
-            text_encoder_path = weights_dir / MODEL_FILES["text_encoder_bf16"]
-            if not text_encoder_path.exists():
-                text_encoder_path = weights_dir / MODEL_FILES["text_encoder_int8"]
-
-            video_vae_path = weights_dir / MODEL_FILES["video_vae_bf16"]
-            audio_vae_path = weights_dir / MODEL_FILES["audio_vae_bf16"]
-            duration_head_path = weights_dir / MODEL_FILES["duration_head_bf16"]
-            spatial_upscaler_path = weights_dir / MODEL_FILES["spatial_upscaler_bf16"]
-
-            model_paths = ModelPaths.from_split(
-                transformer_path=str(transformer_path),
-                text_encoder_path=str(text_encoder_path),
-                video_vae_path=str(video_vae_path),
-                audio_vae_path=str(audio_vae_path) if audio_vae_path.exists() else None,
-                duration_head_path=str(duration_head_path) if duration_head_path.exists() else None,
-            )
-
-            pipeline = DistilledPipeline(
-                model_paths=model_paths,
-                spatial_upsampler_path=str(spatial_upscaler_path) if spatial_upscaler_path.exists() else None,
-                loras=(),
-                device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                quantization=None,
-                compilation_config=None,
-                offload_mode=OffloadMode.NONE,
-                diffvae_optimization=DiffVAEMode.CHUNKED_EAGER,
-            )
-            logger.info("[model_loader] DistilledPipeline loaded successfully.")
-            _pipeline = pipeline
-            elapsed = time.monotonic() - t0
-            logger.info(f"[model_loader] Pipeline ready in {elapsed:.1f}s.")
-            return _pipeline
-
-        except (ImportError, AttributeError) as exc:
-            logger.debug(f"[model_loader] ltx_pipelines fallback: {exc}")
-
-        try:
-            from diffusers import LTXVideoPipeline  # type: ignore
-        except ImportError:
-            from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline  # type: ignore
-
-        pipeline = LTXVideoPipeline.from_pretrained(
-            str(weights_dir),
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
+        # ── Resolve checkpoint files on the volume ───────────────────────────
+        transformer_path = _resolve_transformer(weights_dir)
+        text_encoder_path = _require_first(
+            weights_dir,
+            ["text_encoder_bf16"],
+            "text encoder",
         )
-        if torch.cuda.is_available():
-            pipeline = pipeline.to("cuda")
+        video_vae_path = _resolve_video_vae(weights_dir)
+        # spatial_upsampler_path is a REQUIRED str on DistilledPipeline — the
+        # two-stage pipeline cannot run without it, so fail loudly here rather
+        # than passing None and getting an opaque TypeError deep in the stack.
+        spatial_upscaler_path = _require_first(
+            weights_dir, ["spatial_upscaler_bf16"], "latent spatial upsampler"
+        )
 
-        try:
-            pipeline.enable_xformers_memory_efficient_attention()
-            logger.info("[model_loader] xFormers memory-efficient attention enabled.")
-        except Exception:
+        # Optional slots: absent → pipeline degrades gracefully (no audio track /
+        # no automatic duration prediction).
+        audio_vae_path = weights_dir / MODEL_FILES["audio_vae_bf16"]
+        duration_head_path = weights_dir / MODEL_FILES["duration_head_bf16"]
+        if not audio_vae_path.exists():
             logger.warning(
-                "[model_loader] xFormers not available — using native SDPA attention."
+                "[model_loader] Audio VAE not found — output will be video-only."
             )
+        if not duration_head_path.exists():
+            logger.warning(
+                "[model_loader] Duration head not found — num_frames must be explicit."
+            )
+
+        model_paths = ModelPaths.from_split(
+            transformer_path=str(transformer_path),
+            text_encoder_path=str(text_encoder_path),
+            video_vae_path=str(video_vae_path),
+            audio_vae_path=str(audio_vae_path) if audio_vae_path.exists() else None,
+            duration_head_path=(
+                str(duration_head_path) if duration_head_path.exists() else None
+            ),
+        )
+
+        # ── Resolve runtime knobs ────────────────────────────────────────────
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        quantization = _resolve_quantization(QuantizationKind, transformer_path)
+        offload_mode = _resolve_enum(
+            OffloadMode, os.environ.get("LTX_OFFLOAD_MODE", "none"), "LTX_OFFLOAD_MODE"
+        )
+        diffvae_mode = _resolve_enum(
+            DiffVAEMode,
+            os.environ.get("LTX_DIFFVAE_MODE", "chunked_eager"),
+            "LTX_DIFFVAE_MODE",
+        )
+
+        logger.info(
+            "[model_loader] transformer={} | text_encoder={} | video_vae={}\n"
+            "[model_loader] quantization={} | offload={} | diffvae={} | device={}".format(
+                transformer_path.name,
+                text_encoder_path.name,
+                video_vae_path.name,
+                os.environ.get("LTX_QUANTIZATION", "fp8-cast"),
+                offload_mode.value,
+                diffvae_mode.value,
+                device,
+            )
+        )
+
+        pipeline = DistilledPipeline(
+            model_paths=model_paths,
+            spatial_upsampler_path=str(spatial_upscaler_path),
+            loras=[],
+            device=device,
+            quantization=quantization,
+            compilation_config=None,
+            offload_mode=offload_mode,
+            diffvae_optimization=diffvae_mode,
+        )
 
         _pipeline = pipeline
         elapsed = time.monotonic() - t0
-        logger.info(f"[model_loader] Pipeline ready in {elapsed:.1f}s.")
+        logger.info(f"[model_loader] DistilledPipeline ready in {elapsed:.1f}s.")
         return _pipeline
 
     except torch.cuda.OutOfMemoryError as oom:
@@ -258,6 +297,180 @@ def load_pipeline() -> object:
     except Exception as exc:
         logger.exception(f"[model_loader] Failed to load pipeline: {exc}")
         raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint / knob resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _require_first(weights_dir: Path, keys: list[str], label: str) -> Path:
+    """
+    Return the first existing file among `keys`, else raise a clear error.
+
+    If a ComfyUI-only variant of the same component is present on the volume,
+    say so explicitly — that is the most likely reason a user hits this.
+    """
+    for key in keys:
+        candidate = weights_dir / MODEL_FILES[key]
+        if candidate.exists():
+            return candidate
+
+    tried = ", ".join(MODEL_FILES[k] for k in keys)
+    hint = ""
+    present_comfy = [
+        MODEL_FILES[k]
+        for k in COMFY_ONLY_KEYS
+        if (weights_dir / MODEL_FILES[k]).exists()
+    ]
+    if present_comfy:
+        hint = (
+            "\nThese ComfyUI-only checkpoints ARE on the volume but cannot be "
+            "loaded by ltx-pipelines (the *-comfy-int8-convrot files are for "
+            f"ComfyUI only): {', '.join(present_comfy)}"
+        )
+    raise RuntimeError(
+        f"No {label} checkpoint found under {weights_dir}. Tried: {tried}{hint}"
+    )
+
+
+def _resolve_transformer(weights_dir: Path) -> Path:
+    """
+    Pick the transformer checkpoint according to LTX_TRANSFORMER.
+
+    'distilled' (default) is the two-stage distilled 22B model — the one
+    DistilledPipeline expects (fixed 8-step schedule, CFG=1). 'dev' is the full
+    trainable DiT, provided as an escape hatch.
+
+    Only bf16 (and the nvfp4 pre-quantised) checkpoints are candidates: per the
+    model card the *-comfy-int8-convrot files are ComfyUI-only.
+    """
+    variant = os.environ.get("LTX_TRANSFORMER", "distilled").strip().lower()
+    variants: dict[str, list[str]] = {
+        "distilled": ["transformer_distilled_bf16"],
+        "distilled-nvfp4": ["transformer_distilled_nvfp4"],
+        "dev": ["transformer_dev_bf16"],
+    }
+    if variant not in variants:
+        raise RuntimeError(
+            f"LTX_TRANSFORMER='{variant}' is not recognised. "
+            f"Valid values: {', '.join(sorted(variants))}"
+        )
+    return _require_first(weights_dir, variants[variant], f"{variant} transformer")
+
+
+def _resolve_video_vae(weights_dir: Path) -> Path:
+    """
+    Pick the video VAE.
+
+    Two decoders ship with LTX-2.5 and the decoder kind is read from the file's
+    own metadata:
+      • ...video-vae-bf16.safetensors      → diffusion decoder (higher quality,
+        wants `natten` for full speed; falls back to Triton/eager without it)
+      • ...video-vae-conv-bf16.safetensors → convolutional decoder (much faster,
+        no natten needed)
+
+    LTX_VIDEO_VAE=auto (default) prefers the conv decoder when it is on the
+    volume, because `natten` cannot be installed alongside torch 2.8 (it pins
+    torch==2.13.0), which makes the diffusion decoder the slow path here.
+    """
+    choice = os.environ.get("LTX_VIDEO_VAE", "auto").strip().lower()
+    conv = weights_dir / MODEL_FILES["video_vae_conv_bf16"]
+    diffusion = weights_dir / MODEL_FILES["video_vae_bf16"]
+
+    if choice == "conv":
+        if not conv.exists():
+            raise RuntimeError(
+                f"LTX_VIDEO_VAE=conv but {conv} is not on the volume. "
+                "Download it or use LTX_VIDEO_VAE=diffusion."
+            )
+        return conv
+    if choice == "diffusion":
+        return _require_first(weights_dir, ["video_vae_bf16"], "video VAE")
+    if choice != "auto":
+        raise RuntimeError(
+            f"LTX_VIDEO_VAE='{choice}' is not recognised. "
+            "Valid values: auto, diffusion, conv"
+        )
+
+    if conv.exists():
+        logger.info("[model_loader] Using the convolutional video VAE (faster decode).")
+        return conv
+    if diffusion.exists():
+        logger.info(
+            "[model_loader] Using the diffusion video VAE. `natten` is not "
+            "installable on torch 2.8, so decode runs on the Triton/eager "
+            "fallback — expect slower decoding."
+        )
+        return diffusion
+    raise RuntimeError(f"No video VAE checkpoint found under {weights_dir}.")
+
+
+def _resolve_quantization(quantization_kind_cls: type, transformer_path: Path):
+    """
+    Build the QuantizationPolicy from LTX_QUANTIZATION.
+
+    Defaults to fp8-cast: the bf16 22B transformer is 39.1 GB, which leaves
+    almost no headroom on a 48 GB L40S once the text encoder, VAEs and
+    activations are resident. fp8-cast brings the transformer to ~19.6 GB and
+    needs no extra dependencies on any FP8-capable GPU (sm_89+).
+
+    nvfp4 is rejected on non-Blackwell hardware with an actionable message
+    instead of failing later inside the kernel dispatch.
+    """
+    raw = os.environ.get("LTX_QUANTIZATION", "fp8-cast").strip().lower()
+    if raw in ("", "none", "off", "bf16"):
+        logger.warning(
+            "[model_loader] Quantization disabled. The bf16 transformer needs "
+            "~39 GB VRAM — expect OOM on a 48 GB GPU at anything above 450p."
+        )
+        return None
+
+    try:
+        kind = quantization_kind_cls(raw)
+    except ValueError as exc:
+        valid = ", ".join(k.value for k in quantization_kind_cls)
+        raise RuntimeError(
+            f"LTX_QUANTIZATION='{raw}' is not recognised. Valid values: none, {valid}"
+        ) from exc
+
+    if kind.value.startswith("nvfp4"):
+        capability = (
+            torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+        )
+        if capability[0] < 10:
+            raise RuntimeError(
+                f"LTX_QUANTIZATION='{raw}' requires a Blackwell GPU (compute "
+                f"capability >= 10.0) plus compiled ltx-kernels. This GPU reports "
+                f"sm_{capability[0]}{capability[1]}. Use 'fp8-cast' instead."
+            )
+
+    # nvfp4-prequant reads its scales from the checkpoint, so the pre-quantised
+    # file must be the one that was loaded.
+    if kind.value == "nvfp4-prequant" and "nvfp4" not in transformer_path.name:
+        raise RuntimeError(
+            "LTX_QUANTIZATION='nvfp4-prequant' requires the pre-quantised "
+            "checkpoint. Set LTX_TRANSFORMER=distilled-nvfp4."
+        )
+    if "nvfp4" in transformer_path.name and kind.value != "nvfp4-prequant":
+        raise RuntimeError(
+            f"Transformer '{transformer_path.name}' is pre-quantised to nvfp4 but "
+            f"LTX_QUANTIZATION='{raw}'. Set LTX_QUANTIZATION=nvfp4-prequant."
+        )
+
+    return kind.to_policy(str(transformer_path))
+
+
+def _resolve_enum(enum_cls: type, raw: str, env_name: str):
+    """Map an env-var string onto an enum by value, with a clear error."""
+    value = (raw or "").strip().lower()
+    try:
+        return enum_cls(value)
+    except ValueError as exc:
+        valid = ", ".join(str(m.value) for m in enum_cls)
+        raise RuntimeError(
+            f"{env_name}='{raw}' is not recognised. Valid values: {valid}"
+        ) from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,10 +506,12 @@ def _missing_sentinel_files(weights_dir: Path) -> list[str]:
 
 def _download_weights(weights_dir: Path) -> None:
     """
-    Download all LTX-2.5 model files to the network volume.
+    Download the LTX-2.5 model files needed for distilled inference.
 
-    Uses snapshot_download so that HF handles sharded files, retries,
-    and partial-download resumption transparently.
+    Only REQUIRED_FILES are fetched (via `allow_patterns`). Grabbing the whole
+    repo would pull ~185 GB — every bf16 / ComfyUI-int8 / nvfp4 variant plus the
+    dev transformer, the temporal upscaler and the LoRA — which does not fit
+    alongside itself on a 200 GB volume and is not needed by this handler.
 
     IMPORTANT: HF_TOKEN must be set in the environment (via Runpod secret)
     because Lightricks/LTX-2.5 is a gated repository.
@@ -315,8 +530,14 @@ def _download_weights(weights_dir: Path) -> None:
     if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0") == "1":
         logger.info("[model_loader] hf_transfer enabled for accelerated download.")
 
+    # Optionally also fetch the faster convolutional VAE.
+    allow_patterns = list(REQUIRED_FILES)
+    if os.environ.get("LTX_DOWNLOAD_CONV_VAE", "0") == "1":
+        allow_patterns.append(MODEL_FILES["video_vae_conv_bf16"])
+
     logger.info(
-        f"[model_loader] Downloading '{HF_REPO_ID}' -> '{weights_dir}' ...\n"
+        f"[model_loader] Downloading {len(allow_patterns)} file(s) from "
+        f"'{HF_REPO_ID}' -> '{weights_dir}' ...\n"
         "This only happens once on a fresh volume."
     )
 
@@ -324,16 +545,8 @@ def _download_weights(weights_dir: Path) -> None:
         repo_id=HF_REPO_ID,
         repo_type="model",
         local_dir=str(weights_dir),
-        local_dir_use_symlinks=False,
         token=hf_token,
-        ignore_patterns=[
-            "*.msgpack",
-            "*.h5",
-            "flax_model*",
-            "tf_model*",
-            "rust_model*",
-            "*.ot",
-        ],
+        allow_patterns=allow_patterns,
     )
 
     # Final sanity check: confirm sentinels are now present.

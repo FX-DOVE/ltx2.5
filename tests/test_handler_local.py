@@ -35,6 +35,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -52,10 +53,35 @@ def _make_job(input_dict: dict[str, Any]) -> dict[str, Any]:
     return {"id": "test-job-001", "input": input_dict}
 
 
-def _make_black_frames(t: int = 9, h: int = 480, w: int = 848) -> "np.ndarray":
-    """Return a (T, H, W, 3) uint8 array of black frames for testing."""
-    import numpy as np
-    return (np.zeros((t, h, w, 3), dtype=np.uint8), 42)
+def _make_result(
+    num_frames: int = 9,
+    width: int = 768,
+    height: int = 448,
+    seed: int = 42,
+    audio: Any = None,
+) -> SimpleNamespace:
+    """
+    Stand-in for inference.InferenceResult.
+
+    run_inference() returns the pipeline's LAZY chunk iterator plus the audio
+    track, frame count and tiling config — not a materialised frame array — so
+    the mock mirrors that shape.  cleanup() records that the handler released
+    the conditioning temp dir.
+    """
+    result = SimpleNamespace(
+        video=iter(()),          # encoder is mocked, so no chunks are needed
+        audio=audio,
+        num_frames=num_frames,
+        tiling_config=None,
+        seed=seed,
+        width=width,
+        height=height,
+        cleaned_up=False,
+    )
+    def _cleanup() -> None:
+        result.cleaned_up = True
+    result.cleanup = _cleanup
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,8 +97,6 @@ class TestHandlerUnit(unittest.TestCase):
 
     def _get_handler(self):
         """Import handler with all heavy dependencies mocked out."""
-        import numpy as np
-
         mock_pipeline = MagicMock()
 
         with patch.dict("sys.modules", {
@@ -87,11 +111,9 @@ class TestHandlerUnit(unittest.TestCase):
             mock_model_loader.ensure_weights_present = MagicMock(return_value=None)
             mock_model_loader.load_pipeline = MagicMock(return_value=mock_pipeline)
 
-            # Patch inference so we return fake frames.
+            # Patch inference so we return a fake InferenceResult.
             mock_inference = MagicMock()
-            mock_inference.run_inference = MagicMock(
-                return_value=_make_black_frames()
-            )
+            mock_inference.run_inference = MagicMock(return_value=_make_result())
 
             with patch.dict("sys.modules", {
                 "model_loader": mock_model_loader,
@@ -104,7 +126,9 @@ class TestHandlerUnit(unittest.TestCase):
 
                 import handler as h
 
-                # Patch internals that touch I/O.
+                # Patch internals that touch I/O.  _encode_video is where the
+                # real code calls ltx_pipelines' PyAV encoder, which needs the
+                # actual GPU-decoded chunks.
                 h._PIPELINE = mock_pipeline
                 h._encode_video = MagicMock(return_value=b"FAKEVIDEO" * 10)
                 h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
@@ -207,11 +231,88 @@ class TestHandlerUnit(unittest.TestCase):
 
         # Reset so subsequent tests aren't affected
         h.inference_module.run_inference.side_effect = None
-        h.inference_module.run_inference.return_value = _make_black_frames()
+        h.inference_module.run_inference.return_value = _make_result()
 
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error"], "out_of_memory")
         self.assertFalse(result["retryable"])
+
+    # ── Result lifecycle ──────────────────────────────────────────────────────
+
+    def test_conditioning_tempdir_is_released(self):
+        """
+        The frame iterator is lazy, so the conditioning temp dir must survive
+        until encoding finishes — and must be released once it has.
+        """
+        h = self._get_handler()
+        fake = _make_result()
+        h.inference_module.run_inference.return_value = fake
+
+        h.handler(_make_job({"prompt": "test"}))
+
+        self.assertTrue(fake.cleaned_up, "InferenceResult.cleanup() was never called")
+
+    def test_cleanup_runs_even_when_encoding_fails(self):
+        """A failed encode must not leak the conditioning temp dir."""
+        h = self._get_handler()
+        fake = _make_result()
+        h.inference_module.run_inference.return_value = fake
+        h._encode_video = MagicMock(side_effect=RuntimeError("libx264 exploded"))
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["error"], "encoding_error")
+        self.assertTrue(fake.cleaned_up, "cleanup() skipped on the failure path")
+
+    def test_reported_frame_count_comes_from_the_pipeline(self):
+        """
+        The duration head can pick a different frame count than the request, so
+        the response must echo what was generated, not what was asked for.
+        """
+        h = self._get_handler()
+        h.inference_module.run_inference.return_value = _make_result(num_frames=121)
+
+        result = h.handler(_make_job({"prompt": "test", "num_frames": 241}))
+
+        self.assertEqual(result["num_frames"], 121)
+        self.assertAlmostEqual(result["duration_seconds"], round(121 / 24, 2))
+
+    def test_large_video_is_uploaded_not_base64(self):
+        """Outputs above the base64 threshold go to object storage."""
+        h = self._get_handler()
+        h._encode_video = MagicMock(return_value=b"\x00" * (h._MAX_BASE64_BYTES + 1))
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["video_url"], "https://example.com/video.mp4")
+        self.assertNotIn("video_base64", result)
+
+    def test_upload_failure_falls_back_to_base64(self):
+        """A storage outage should degrade to base64 rather than fail the job."""
+        h = self._get_handler()
+        h._encode_video = MagicMock(return_value=b"\x00" * (h._MAX_BASE64_BYTES + 1))
+        h._upload_video = MagicMock(side_effect=RuntimeError("no bucket configured"))
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("video_base64", result)
+        self.assertNotIn("video_url", result)
+
+    def test_has_audio_reflects_the_generated_waveform(self):
+        """LTX-2.5 emits audio alongside video; the response must report it."""
+        h = self._get_handler()
+
+        silent = _make_result(audio=None)
+        h.inference_module.run_inference.return_value = silent
+        self.assertFalse(h.handler(_make_job({"prompt": "test"}))["has_audio"])
+
+        with_audio = _make_result(
+            audio=SimpleNamespace(waveform=SimpleNamespace(numel=lambda: 48000),
+                                  sampling_rate=48000)
+        )
+        h.inference_module.run_inference.return_value = with_audio
+        self.assertTrue(h.handler(_make_job({"prompt": "test"}))["has_audio"])
 
     # ── Response shape ────────────────────────────────────────────────────────
 
@@ -224,7 +325,7 @@ class TestHandlerUnit(unittest.TestCase):
 
         required_fields = {
             "status", "duration_seconds", "generation_time_seconds",
-            "seed_used", "resolution", "num_frames", "fps",
+            "seed_used", "resolution", "num_frames", "fps", "has_audio",
         }
         self.assertTrue(required_fields.issubset(result.keys()),
                         f"Missing fields: {required_fields - result.keys()}")
@@ -368,9 +469,11 @@ class TestHandlerIntegration(unittest.TestCase):
 
         job = _make_job({
             "prompt": "a single red sphere rolling across a white table",
-            "resolution": "480p",
-            "num_frames": 9,    # minimum frames — keeps the test fast
-            "num_inference_steps": 5,  # low steps for speed, quality doesn't matter here
+            "resolution": "480p",   # 896×512 — %64, legal for the two-stage pipeline
+            "num_frames": 9,        # minimum frames — keeps the test fast
+            # NOTE: num_inference_steps / guidance_scale are deliberately omitted.
+            # The distilled checkpoint has a baked-in 8+3 step sigma schedule and
+            # no CFG branch, so those fields are accepted but have no effect.
         })
 
         t0 = time.monotonic()
@@ -407,10 +510,10 @@ def main():
     args, remaining = parser.parse_known_args()
 
     if args.integration:
-        print("⚡ Integration mode enabled — running full pipeline tests.")
+        print("[integration] Integration mode enabled - running full pipeline tests.")
         TestHandlerIntegration._run_integration = True
     else:
-        print("🧪 Unit mode — mocking GPU and model dependencies.")
+        print("[unit] Unit mode - mocking GPU and model dependencies.")
 
     # Hand off to unittest runner, forwarding remaining args (e.g. -v).
     unittest.main(argv=[sys.argv[0]] + remaining, verbosity=2)

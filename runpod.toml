@@ -9,7 +9,7 @@
 #   • runpodctl               (see README.md for deploy.sh example)
 #
 # GPU: NVIDIA L40S (48 GB VRAM)
-# Resolution: 450p (768×448) default, up to 720p
+# Resolution: 450p (768×448) default, up to 1080p (1920×1088)
 # Max duration: 10 seconds (241 frames @ 24 fps)
 # Field explanations map to the Runpod console field names exactly.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,13 +24,17 @@ name = "ltx25-video-gen"
 container_image = "ghcr.io/fx-dove/ltx2.5:latest"
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
-# Primary: NVIDIA L40S (48 GB GDDR6) — fits the full bfloat16 pipeline
-#          at 450p (768×448) with comfortable VRAM headroom.
-#          Estimated VRAM usage at 450p / 241 frames: ~28–35 GB.
-# Fallback: RTX 4090 (24 GB) — can run 450p but at reduced frame counts (≤ 97);
-#           set num_frames ≤ 97 in requests to avoid OOM.
+# Primary: NVIDIA L40S (48 GB GDDR6, sm_89).
+#   The 22B bf16 transformer alone is ~39 GB, which leaves no room for the
+#   Gemma-4-12B text encoder and the two VAEs, so the image defaults to
+#   LTX_QUANTIZATION=fp8-cast (~19.6 GB for the transformer).  sm_89 supports
+#   fp8 but NOT nvfp4 — nvfp4-* needs Blackwell (sm_100+) and is rejected here.
+# Fallback: none recommended.  A 24 GB card (RTX 4090/L4) cannot hold the
+#   fp8 transformer plus the text encoder and VAEs resident; it would need
+#   LTX_OFFLOAD_MODE=cpu and a much larger execution_timeout.
 gpu_type_id = "NVIDIA L40S"   # Runpod GPU type string
-# fallback_gpu_type_id = "NVIDIA GeForce RTX 4090"   # uncomment to enable
+# NOTE: if workers sit in THROTTLED, the selected datacenter has no L40S
+# capacity — widen the GPU pool (ADA_48_PRO) or add more data centers.
 
 # ── Scaling ───────────────────────────────────────────────────────────────────
 # min_workers = 0  →  you pay NOTHING while idle.
@@ -47,9 +51,11 @@ max_workers = 3
 idle_timeout = 60          # seconds
 
 # execution_timeout: maximum wall-clock seconds allowed for a single job.
-# 450p / 241 frames / 40 steps typically takes 40–90 s on an L40S.
-# Set comfortably above the slowest expected generation.
-execution_timeout = 180    # seconds (3 min)
+# The distilled checkpoint runs a fixed 8-step stage 1 + 3-step stage 2 schedule
+# (num_inference_steps in the request is accepted but ignored).  Budget for the
+# chunked VAE decode and the libx264 encode as well, which stream after
+# denoising finishes and dominate at higher resolutions.
+execution_timeout = 600    # seconds (10 min)
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 # container_disk_size: ephemeral disk for the container's OS + pip cache.
@@ -69,12 +75,16 @@ mount_path = "/runpod-volume"
 # NEVER put real values in this file — it is committed to version control.
 [endpoint.env]
 
-# Required: Hugging Face token for downloading the gated LTX-Video model.
+# Required: Hugging Face token for downloading the gated LTX-2.5 checkpoints.
 # Create a secret named "HF_TOKEN" in the Runpod console and reference it.
+# Only needed on the very first cold start — once the six required safetensors
+# are on the network volume, the handler never contacts Hugging Face again.
 HF_TOKEN = { secret = "HF_TOKEN" }
 
 # Optional: S3-compatible storage for video uploads.
-# If not set, Runpod built-in temp storage is used (URLs valid ~1 hour).
+# If neither this nor BUCKET_ENDPOINT_URL is set, the handler inlines the MP4 as
+# base64 in the job result — Runpod caps results at 20 MB, so long or
+# high-resolution clips will fail without storage configured.
 S3_ENDPOINT_URL = "https://YOUR_ACCOUNT.r2.cloudflarestorage.com"
 S3_BUCKET       = "your-bucket-name"
 S3_REGION       = "auto"
@@ -86,6 +96,33 @@ PRESIGNED_URL_TTL_SECONDS = "86400"   # 24 hours
 # These are already set in the Dockerfile; listed here for documentation.
 HF_HUB_ENABLE_HF_TRANSFER = "1"
 PYTHONUNBUFFERED = "1"
+# Required to keep the fp8 transformer + VAE from fragmenting VRAM on a 48 GB card.
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+
+# ── LTX-2.5 runtime knobs (Dockerfile defaults shown; override to change) ─────
+# LTX_TRANSFORMER: distilled | distilled-nvfp4 (sm_100+ only) | dev
+LTX_TRANSFORMER = "distilled"
+# LTX_QUANTIZATION: fp8-cast | fp8-scaled-mm | nvfp4-cast | nvfp4-prequant | none
+# fp8-cast is required on a 48 GB L40S — bf16 alone is ~39 GB.
+LTX_QUANTIZATION = "fp8-cast"
+# LTX_OFFLOAD_MODE: none | cpu | disk.  Switch to "cpu" for 1080p.
+LTX_OFFLOAD_MODE = "none"
+# LTX_VIDEO_VAE: auto | conv | diffusion.  "auto" prefers the conv VAE when it
+# is on the volume; the DiffVAE wants `natten`, which cannot be built against
+# torch 2.8, so it runs a slower Triton/eager fallback.
+LTX_VIDEO_VAE = "auto"
+# LTX_DIFFVAE_MODE: chunked_eager | chunked_compile | combined_compile (needs
+# natten) | blackwell_dsl (sm_100+).  Only used with the diffusion VAE.
+LTX_DIFFVAE_MODE = "chunked_eager"
+# Set to "1" to fetch ltx-2.5-video-vae-conv-bf16 on cold start if absent.
+# LTX_DOWNLOAD_CONV_VAE = "0"
+
+# ── Alternative upload path: Runpod's own bucket helper ───────────────────────
+# Used only when S3_BUCKET is unset.  These exact names are what
+# runpod.serverless.utils.rp_upload reads; it returns a 7-day presigned URL.
+# BUCKET_ENDPOINT_URL     = "https://YOUR_ACCOUNT.r2.cloudflarestorage.com"
+# BUCKET_ACCESS_KEY_ID     = { secret = "S3_ACCESS_KEY_ID" }
+# BUCKET_SECRET_ACCESS_KEY = { secret = "S3_SECRET_ACCESS_KEY" }
 
 # ── Model path resolution (optional overrides) ────────────────────────────────
 # The handler discovers models via this priority waterfall:

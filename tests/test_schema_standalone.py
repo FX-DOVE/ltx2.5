@@ -130,16 +130,36 @@ class TestResolution(unittest.TestCase):
         self.assertEqual(RESOLUTION_MAP[Resolution.r450p], (768, 448))
 
     def test_480p_dimensions(self):
-        self.assertEqual(RESOLUTION_MAP[Resolution.r480p], (848, 480))
+        self.assertEqual(RESOLUTION_MAP[Resolution.r480p], (896, 512))
+
+    def test_576p_dimensions(self):
+        self.assertEqual(RESOLUTION_MAP[Resolution.r576p], (1024, 576))
 
     def test_720p_dimensions(self):
-        self.assertEqual(RESOLUTION_MAP[Resolution.r720p], (1280, 720))
+        self.assertEqual(RESOLUTION_MAP[Resolution.r720p], (1280, 704))
 
     def test_1080p_dimensions(self):
-        self.assertEqual(RESOLUTION_MAP[Resolution.r1080p], (1920, 1080))
+        self.assertEqual(RESOLUTION_MAP[Resolution.r1080p], (1920, 1088))
+
+    def test_every_resolution_is_two_stage_legal(self):
+        """
+        The DistilledPipeline renders stage 1 at half size and upsamples ×2, so
+        upstream assert_resolution(..., is_two_stage=True) requires the FINAL
+        width and height to be divisible by 64.  A token that violates this
+        raises before a single denoising step runs, so guard every entry.
+        """
+        for res, (w, h) in RESOLUTION_MAP.items():
+            with self.subTest(resolution=res.value):
+                self.assertEqual(w % 64, 0, f"{res.value}: width {w} is not %64")
+                self.assertEqual(h % 64, 0, f"{res.value}: height {h} is not %64")
+
+    def test_every_enum_member_has_dimensions(self):
+        for res in Resolution:
+            with self.subTest(resolution=res.value):
+                self.assertIn(res, RESOLUTION_MAP)
 
     def test_all_resolutions_accepted(self):
-        for res in ("450p", "480p", "720p", "1080p"):
+        for res in ("450p", "480p", "576p", "720p", "1080p"):
             with self.subTest(resolution=res):
                 obj = InferenceInput(prompt="test", resolution=res)
                 self.assertEqual(obj.resolution.value, res)

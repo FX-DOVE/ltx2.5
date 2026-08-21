@@ -1,52 +1,64 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # LTX-2.5 Runpod Serverless – Python dependencies
 #
-# Base image: runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-# (torch, torchvision, torchaudio, cuda already bundled in the base image)
+# Base image: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+#   → torch 2.8.0 + torchaudio 2.8.0 + CUDA 12.8.1, Python 3.12
+#
+# The base image already satisfies ltx-core's `torch~=2.7` constraint, so torch
+# is pinned (not upgraded) here to stop pip from swapping in a PyPI wheel built
+# against a different CUDA runtime.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Runpod Serverless SDK ───────────────────────────────────────────────────
+# ── Runpod Serverless SDK ────────────────────────────────────────────────────
 runpod>=1.7.7
 
-# ── Hugging Face tooling & acceleration ──────────────────────────────────────
-huggingface_hub[cli]>=0.26.0
-hf_transfer>=0.1.8
+# ── Torch stack (already present in the base image — pinned, never resolved) ──
+torch==2.8.0
+torchaudio==2.8.0
 
-# ── Input validation & Schemas ───────────────────────────────────────────────
-pydantic>=2.7.0
+# ── Lightricks LTX-2.5 official packages ─────────────────────────────────────
+# The LTX-2.5 pipelines live in the Lightricks/LTX-2 monorepo under packages/.
+# NOTE: the old `Lightricks/LTX-Video` repo has NO `ltx_pipelines` subdirectory
+# and `Lightricks/LTX-2.5` does not exist as a GitHub repo — both previously
+# referenced here made `pip install` fail, so the image never built.
+# PyPI still ships ltx-core/ltx-pipelines 1.0.0; we need 1.2.0 (LTX-2.5
+# checkpoints, ancestral sampler, nvfp4/fp8 policies), hence the git pins.
+ltx-core @ git+https://github.com/Lightricks/LTX-2.git@400fd31054597515f47125691032c04b1c3ee24e#subdirectory=packages/ltx-core
+ltx-pipelines @ git+https://github.com/Lightricks/LTX-2.git@400fd31054597515f47125691032c04b1c3ee24e#subdirectory=packages/ltx-pipelines
 
-# ── Image / Video Processing ─────────────────────────────────────────────────
-Pillow>=10.3.0
-imageio[ffmpeg]>=2.34.0
-imageio-ffmpeg>=0.5.1
-
-# ── LTX-2.5 Diffusers Stack ───────────────────────────────────────────────────
-# Bleeding-edge diffusers is required for LTXVideoPipeline + LTXVideoCondition.
-git+https://github.com/huggingface/diffusers.git
-transformers>=4.48.0
-accelerate>=0.33.0
+# ── Transformers (text encoder: Gemma-4-12B with LTX projection) ──────────────
+# ltx-core requires >=5.8.0,<5.15. transformers 5.15.0 removed
+# `config.head_dim` on gemma4_unified, which breaks the LTX text encoder.
+transformers==5.14.1
+accelerate>=1.0.0
+safetensors>=0.4.5
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 
-# ── Lightricks LTX-2.5 official packages ─────────────────────────────────────
-# ltx_pipelines / ltx_core — primary pipeline used by model_loader.py.
-# Provides: DistilledPipeline, ModelPaths, DiffVAEMode, OffloadMode.
-git+https://github.com/Lightricks/LTX-Video.git#subdirectory=ltx_pipelines
+# ── Hugging Face download tooling ────────────────────────────────────────────
+huggingface_hub>=0.34.0
+hf_transfer>=0.1.8
 
-# ltx_video — fallback pipeline (LTXVideoPipeline from the older API).
-# Used when ltx_pipelines is not available (ImportError path in model_loader.py).
-git+https://github.com/Lightricks/LTX-Video.git
-
-# ── Attention optimisation (optional but recommended on L40S) ─────────────────
-# xformers provides memory-efficient attention for the diffusers fallback path.
-# Skipped gracefully by model_loader.py if not installed.
-xformers>=0.0.27
-
-# ── Numerics & Tensors ───────────────────────────────────────────────────────
+# ── Numerics / tensors ───────────────────────────────────────────────────────
 numpy>=1.26.0
 einops>=0.8.0
+scipy>=1.14
 
-# ── Storage & Utilities ──────────────────────────────────────────────────────
+# ── Media I/O ────────────────────────────────────────────────────────────────
+# PyAV is the encoder used by ltx_pipelines.utils.media_io.encode_video
+# (libx264 + audio mux). openimageio is an ltx-pipelines dependency (EXR/HDR).
+av>=13.0.0
+openimageio>=3.0.0
+Pillow>=10.3.0
+
+# ── Input validation & schemas ───────────────────────────────────────────────
+pydantic>=2.7.0
+
+# ── Misc runtime deps ────────────────────────────────────────────────────────
+# typing_extensions is imported by ltx_pipelines.utils.quantization_factory but
+# not declared by the package — pin it explicitly.
+typing_extensions>=4.12
+cloudpickle>=3.1
 boto3>=1.34.0
 requests>=2.32.0
 tqdm>=4.66.0

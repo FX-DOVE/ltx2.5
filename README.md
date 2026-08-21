@@ -1,6 +1,10 @@
 # LTX-2.5 Runpod Serverless Endpoint
 
-> **Lightricks LTX-Video-2.5** deployed as a cost-efficient **Runpod Serverless** endpoint with network-volume weight caching — pay nothing while idle, load instantly after the first cold start.
+> [**Lightricks/LTX-2.5**](https://huggingface.co/Lightricks/LTX-2.5) — a 22B DiT
+> that generates video **and** synchronised audio in one pass — deployed as a
+> cost-efficient **Runpod Serverless** endpoint with network-volume weight
+> caching. Pay nothing while idle; skip the download on every cold start after
+> the first.
 
 ---
 
@@ -24,19 +28,19 @@
 │                           Runpod Platform                              │
 │                                                                        │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │  Serverless Endpoint  (min=0 workers, max=2 workers)             │  │
+│  │  Serverless Endpoint  (min=0 workers, max=3 workers)             │  │
 │  │                                                                  │  │
 │  │  Cold start sequence (once per new worker):                      │  │
 │  │    1. Mount network volume at /runpod-volume                     │  │
 │  │    2. ensure_weights_present()                                   │  │
-│  │       ├─ [FIRST TIME ONLY] download ~25 GB from Hugging Face     │  │
+│  │       ├─ [FIRST TIME ONLY] download ~66 GB from Hugging Face     │  │
 │  │       └─ [SUBSEQUENT]      files already on volume → skip        │  │
 │  │    3. load_pipeline()  → load bfloat16 model into GPU VRAM       │  │
 │  │                                                                  │  │
 │  │  Warm request:                                                   │  │
 │  │    1. Validate JSON input (Pydantic)                             │  │
-│  │    2. Run LTX-2.5 inference                                      │  │
-│  │    3. Encode MP4  →  upload to S3/R2 (or Runpod temp storage)   │  │
+│  │    2. Run LTX-2.5 inference (video + audio)                       │  │
+│  │    3. Encode MP4 (libx264 + audio mux) → upload to S3/R2          │  │
 │  │    4. Return {status, video_url, generation_time_seconds, …}     │  │
 │  │                                                                  │  │
 │  │  ┌─────────────────────────────────────────────────────────┐    │  │
@@ -63,11 +67,12 @@ ltx25-runpod-serverless/
 │   ├── inference.py      # text2video / image2video / flf2video logic
 │   └── schema.py         # Pydantic input/output schemas
 ├── docker/
-│   └── Dockerfile        # multi-stage, CUDA 12.8 + PyTorch 2.7, no weights
+│   └── Dockerfile        # single-stage, CUDA 12.8.1 + PyTorch 2.8.0, no weights
 ├── scripts/
 │   └── download_weights.py   # standalone pre-population script
 ├── tests/
-│   └── test_handler_local.py # unit + integration tests
+│   ├── test_schema_standalone.py  # schema-only, needs just pydantic
+│   └── test_handler_local.py      # handler unit tests + opt-in integration test
 ├── .dockerignore
 ├── .gitignore
 ├── .env.example          # copy to .env, fill in real values
@@ -85,7 +90,7 @@ ltx25-runpod-serverless/
 - GitHub account (for GHCR)
 - Runpod account with billing set up
 - Hugging Face account with a **read token** that has **"read access to gated repos"** scope
-- Access granted to [`Lightricks/LTX-Video-2-0-5B-Distilled`](https://huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled) on Hugging Face
+- Access granted to [`Lightricks/LTX-2.5`](https://huggingface.co/Lightricks/LTX-2.5) on Hugging Face
 
 ---
 
@@ -104,7 +109,14 @@ cp .env.example .env
 
 1. Go to **Runpod Console → Storage → Network Volumes → Create**.
 2. **Name:** `ltx25-weights` (or any name).
-3. **Size:** ≥ 100 GB (the LTX-2.5 checkpoint pack is ~25–30 GB; leave headroom for future updates).
+3. **Size:** ≥ 100 GB. The six files this endpoint actually needs total **~66 GB**:
+   the 22B distilled transformer (39.1 GB), the Gemma-4-12B text encoder with
+   projections (24.5 GB), the video VAE (1.4 GB), the audio VAE (0.34 GB), the
+   ×2 latent spatial upscaler (0.93 GB) and the duration head (3.7 MB).
+   `download_weights.py` fetches only those — the full `Lightricks/LTX-2.5` repo
+   is ~186 GB because it also carries the dev, nvfp4 and ComfyUI-int8 variants,
+   the 450 LoRA and the temporal upscaler, none of which this handler loads.
+   Size the volume ≥ 100 GB so a future checkpoint revision still fits.
 4. **Region:** same region you'll deploy your endpoint (latency matters for cold start).
 5. Note the **Volume ID** — you'll need it in Step 4.
 
@@ -159,11 +171,11 @@ Go to **Runpod Console → Serverless → Endpoints → New Endpoint**.
 |------------------------|----------------------------------------------------------|
 | **Name**               | `ltx25-video-gen`                                        |
 | **Container Image**    | `ghcr.io/<YOUR_ORG>/ltx25-runpod-serverless:latest`     |
-| **GPU Type**           | NVIDIA RTX PRO 6000 (96 GB) — *fallback: H100 80 GB*    |
+| **GPU Type**           | NVIDIA L40S (48 GB) — see [GPU Notes](#gpu-notes)        |
 | **Min Workers**        | `0`                                                      |
-| **Max Workers**        | `2`                                                      |
+| **Max Workers**        | `3`                                                      |
 | **Idle Timeout**       | `60` seconds                                             |
-| **Execution Timeout**  | `300` seconds                                            |
+| **Execution Timeout**  | `600` seconds                                            |
 | **Container Disk**     | `50` GB                                                  |
 | **Network Volume**     | Select `ltx25-weights`, mount at `/runpod-volume`        |
 
@@ -197,8 +209,6 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/run" \
       "resolution": "720p",
       "num_frames": 97,
       "fps": 24,
-      "num_inference_steps": 40,
-      "guidance_scale": 3.5,
       "seed": 42
     }
   }'
@@ -227,15 +237,23 @@ Returns the full result JSON when inference completes:
 ```json
 {
   "status": "success",
+  "mode": "text2video",
   "video_url": "https://your-r2-bucket.r2.cloudflarestorage.com/ltx-2.5/abc123.mp4?...",
   "duration_seconds": 2.04,
   "generation_time_seconds": 47.3,
   "seed_used": 1234,
-  "resolution": "1280x720",
+  "resolution": "896x512",
   "num_frames": 49,
-  "fps": 24
+  "fps": 24,
+  "has_audio": true
 }
 ```
+
+`has_audio` reports whether LTX-2.5's joint audio head produced a track — the
+model generates video and audio together, and the MP4 has both muxed in. Results
+under 5 MB come back as `video_base64` instead of `video_url`; anything larger
+needs object storage configured (see [Step 3](#step-3--set-runpod-secrets)),
+since Runpod caps job results at 20 MB.
 
 ### Image-to-Video
 
@@ -277,30 +295,61 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
 | Field                  | Type            | Default      | Description                                               |
 |------------------------|-----------------|--------------|-----------------------------------------------------------|
 | `prompt`               | string          | **required** | Text description (1–2000 chars)                           |
-| `mode`                 | enum            | `text2video` | `text2video` \| `image2video` \| `flf2video`              |
+| `mode`                 | enum            | `text2video` | `text2video` \| `image2video` \| `flf2video`. Auto-promoted when images are supplied |
 | `first_frame_image`    | string          | `null`       | Base64 or HTTPS URL. Required for `image2video`/`flf2video`|
 | `last_frame_image`     | string          | `null`       | Base64 or HTTPS URL. Required for `flf2video`             |
-| `negative_prompt`      | string          | (see schema) | Negative conditioning text                                |
-| `resolution`           | enum            | `720p`       | `480p` (848×480) \| `720p` (1280×720) \| `1080p` (1920×1080)|
-| `num_frames`           | int             | `97`         | Must satisfy `(N−1) % 8 == 0`. Range: 9–257              |
-| `fps`                  | int             | `24`         | Output frame rate. Range: 8–30                           |
-| `num_inference_steps`  | int             | `40`         | Denoising steps. Range: 10–100                           |
-| `guidance_scale`       | float           | `3.5`        | CFG scale. Range: 1.0–10.0                               |
-| `seed`                 | int \| null     | `null`       | RNG seed for reproducibility. `null` = random            |
+| `resolution`           | enum            | `450p`       | `450p` (768×448) \| `480p` (896×512) \| `576p` (1024×576) \| `720p` (1280×704) \| `1080p` (1920×1088) |
+| `num_frames`           | int             | `241`        | Must satisfy `(N−1) % 8 == 0`. Range: 9–257               |
+| `fps`                  | int             | `24`         | Output frame rate. Range: 8–30                            |
+| `conditioning_strength`| float           | `1.0`        | How tightly the conditioning image(s) constrain the result. Range: >0–1.0 |
+| `seed`                 | int \| null     | `null`       | RNG seed for reproducibility. `null` = random             |
+| `negative_prompt`      | string          | (see schema) | **Accepted but ignored** — see below                      |
+| `num_inference_steps`  | int             | `40`         | **Accepted but ignored** — see below                      |
+| `guidance_scale`       | float           | `3.5`        | **Accepted but ignored** — see below                      |
+
+#### Why three fields are ignored
+
+This endpoint runs the **distilled** LTX-2.5 checkpoint, which is
+guidance-distilled with a baked-in sigma schedule: 8 steps in stage 1, then a
+2× latent upsample and 3 refinement steps in stage 2. It has no
+classifier-free-guidance branch and no negative-conditioning path, so
+`ltx_pipelines`' `DistilledPipeline.__call__` accepts no `negative_prompt`,
+`num_inference_steps` or `guidance_scale` argument at all. The schema keeps the
+three fields so existing callers don't break, but they have no effect on output.
+Set `LTX_TRANSFORMER=dev` on the endpoint to run the non-distilled checkpoint
+instead (slower, and still driven by the pipeline's own schedule here).
+
+#### Why the resolution values look unusual
+
+`DistilledPipeline` is two-stage, so upstream `assert_resolution(..., is_two_stage=True)`
+requires the **final** width and height to be divisible by **64** — not 32. The
+conventional 848×480, 1280×720 and 1920×1080 all fail that check and raise a
+`ValueError` before a single denoising step runs, which is why the tokens map to
+896×512, 1280×704 and 1920×1088 instead.
 
 ---
 
 ## Performance & Cost Notes
 
-### Timing Estimates (RTX PRO 6000, 96 GB)
+### Timing Estimates (L40S 48 GB, `fp8-cast`)
+
+Every warm figure below is for the same fixed schedule — the distilled
+checkpoint always runs 8 stage-1 steps, a ×2 latent upsample, then 3 stage-2
+refinement steps. `num_inference_steps` in the request does not change it.
 
 | Phase                            | Duration         | Notes                                        |
 |----------------------------------|------------------|----------------------------------------------|
-| First-ever cold start (download) | 8–15 min         | Downloads ~25–30 GB; paid once, volume-cached |
-| Subsequent cold starts           | 30–90 s          | Volume-load: weight check + VRAM load only   |
-| Warm inference — 480p / 49f      | ~20–35 s         | 40 steps default                             |
-| Warm inference — 720p / 97f      | ~60–120 s        | 40 steps default                             |
-| Warm inference — 1080p / 97f     | ~120–200 s       | May OOM on H100 80 GB                        |
+| First-ever cold start (download) | 20–40 min        | Downloads ~66 GB; paid once, volume-cached   |
+| Subsequent cold starts           | 60–150 s         | Volume-load: weight check + fp8 cast into VRAM |
+| Warm inference — 450p / 121f     | ~40–70 s         | Includes chunked VAE decode + libx264 encode |
+| Warm inference — 450p / 241f     | ~70–130 s        | The schema default                           |
+| Warm inference — 720p / 121f     | ~110–190 s       | Decode dominates at this size                |
+| Warm inference — 1080p / 121f    | ~240–420 s       | Needs `LTX_OFFLOAD_MODE=cpu` on 48 GB        |
+
+These are order-of-magnitude estimates, not measurements from this endpoint —
+they have not been benchmarked on the deployed worker. Treat them as a guide for
+sizing `execution_timeout`, and measure with the `generation_time_seconds` field
+the handler returns.
 
 ### Understanding Cold Starts vs. Warm Requests
 
@@ -308,17 +357,17 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
 
 **Reality:**
 - The **network volume** persists between scale-to-zero events. Weights downloaded on the first cold start stay on the volume forever.
-- Subsequent cold starts only pay the cost of **re-loading weights from disk into GPU VRAM** (~30–90 s) — not re-downloading.
+- Subsequent cold starts only pay the cost of **re-loading weights from disk into GPU VRAM** (~60–150 s) — not re-downloading.
 - Warm workers (still running, in their idle window) serve requests with **no loading cost** at all.
 
 ```
                     [First cold start on fresh volume]
-  Worker starts → download 25 GB from HF (8–15 min) → load VRAM → serve
+  Worker starts → download 66 GB from HF (20–40 min) → load VRAM → serve
 
   [Scale to zero after idle_timeout]
 
                     [Any subsequent cold start]
-  Worker starts → check volume (files exist!) → skip download → load VRAM (~60 s) → serve
+  Worker starts → check volume (files exist!) → skip download → load VRAM (~2 min) → serve
                              ^^^^^^^^^^^^
                           This is the key insight
 ```
@@ -336,12 +385,21 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
 
 ### Unit Tests (no GPU required)
 
+Two suites run without a GPU, CUDA, or the LTX packages installed — both mock
+the pipeline and the encoder:
+
 ```bash
-pip install -r requirements.txt
-python tests/test_handler_local.py
-# or
-pytest tests/test_handler_local.py -v
+python tests/test_schema_standalone.py
 ```
+
+```bash
+python tests/test_handler_local.py
+```
+
+`test_schema_standalone.py` needs only `pydantic`; it checks every mode,
+the `(N−1) % 8 == 0` frame rule, and that all five resolutions are ÷64 legal.
+`test_handler_local.py` needs `pydantic` and `loguru`; it covers the handler's
+response contract, conditioning temp-file cleanup, and the upload/base64 split.
 
 ### Integration Test (GPU + volume required)
 
@@ -361,13 +419,16 @@ Create `test_input.json`:
   "id": "local-test-001",
   "input": {
     "prompt": "a golden retriever playing fetch on a sunny beach",
-    "resolution": "480p",
+    "resolution": "450p",
     "num_frames": 9,
-    "num_inference_steps": 5,
     "seed": 42
   }
 }
 ```
+
+`num_frames: 9` is the smallest legal value and the cheapest way to smoke-test a
+real worker — the step count is fixed regardless, so frames are the only knob
+that shortens the run.
 
 ```bash
 cd src
@@ -407,7 +468,7 @@ RUNPOD_VOLUME_PATH=/runpod-volume HF_TOKEN=hf_xxx \
 - You haven't accepted the model license on Hugging Face
 
 **Fix:**
-1. Visit [huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled](https://huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled), click **"Agree and access repository"**.
+1. Visit [huggingface.co/Lightricks/LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5), click **"Agree and access repository"**.
 2. Re-generate your token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) with **"Read access to gated repos"** scope checked.
 3. Update the `HF_TOKEN` secret in Runpod.
 
@@ -417,15 +478,28 @@ RUNPOD_VOLUME_PATH=/runpod-volume HF_TOKEN=hf_xxx \
 
 **Cause:** The requested resolution/frames exceeds available VRAM.
 
+The 22B transformer dominates VRAM, and how much it needs depends entirely on
+`LTX_QUANTIZATION`:
+
+| Checkpoint / policy       | Transformer VRAM | Requires        |
+|---------------------------|------------------|-----------------|
+| bf16, `LTX_QUANTIZATION` unset | ~39 GB      | 80 GB+ card     |
+| `fp8-cast` (**default**)  | ~19.6 GB         | sm_89+ (L40S ✅) |
+| `nvfp4-*`                 | ~17.4 GB         | sm_100+ (Blackwell only — **not** L40S) |
+
 **Fix:**
 
-| GPU           | Safe config                          |
-|---------------|--------------------------------------|
-| RTX PRO 6000 (96 GB) | Up to 1080p / 97f           |
-| H100 80 GB    | Up to 720p / 97f (1080p may OOM)    |
-| A100 40 GB    | Up to 480p / 49f                    |
+| GPU                  | Safe config with the default `fp8-cast`     |
+|----------------------|---------------------------------------------|
+| RTX PRO 6000 (96 GB) | Up to 1080p / 241f                          |
+| H100 80 GB           | Up to 1080p / 121f                          |
+| L40S 48 GB           | 450p / 241f, 720p / 121f; 1080p needs `LTX_OFFLOAD_MODE=cpu` |
+| 24 GB cards          | Not recommended — needs `LTX_OFFLOAD_MODE=cpu` even at 450p |
 
-Reduce `resolution`, `num_frames`, or `num_inference_steps`. The error response includes guidance text.
+Reduce `resolution` or `num_frames`. Note that `num_inference_steps` has **no
+effect** — the distilled checkpoint runs a fixed 8-step + 3-step schedule — so
+lowering it will not relieve memory pressure. The error response includes
+guidance text.
 
 ---
 
@@ -446,15 +520,23 @@ If `download_weights.py` was interrupted mid-run, re-run it. The sentinel-file c
 
 ---
 
-## GPU Fallback Comment
+## GPU Notes
 
-> **Primary:** NVIDIA RTX PRO 6000 (96 GB GDDR7)  
-> **Fallback:** NVIDIA H100 SXM/NVL 80 GB HBM3  
+> **Primary:** NVIDIA L40S (48 GB GDDR6, sm_89)
 >
-> To enable the H100 fallback in the Runpod console, add H100 80GB as a secondary GPU type in the endpoint's GPU configuration. Note that 1080p generation may OOM on the H100 80 GB — if you see `out_of_memory` errors, switch callers to `resolution: "720p"`.
+> The image defaults to `LTX_QUANTIZATION=fp8-cast` because the bf16 transformer
+> alone (~39 GB) leaves no room for the Gemma-4-12B text encoder and the video +
+> audio VAEs on a 48 GB card. sm_89 supports fp8 but **not** nvfp4 — the nvfp4
+> checkpoints need Blackwell (sm_100+) and `model_loader.py` rejects them below
+> that rather than failing cryptically at load time.
+>
+> If workers sit in **THROTTLED** with 0 idle and 0 unhealthy, that is a capacity
+> problem, not a code problem: the selected data centers have no free L40S. Widen
+> the GPU pool (`ADA_48_PRO`) or add data centers in the endpoint config — jobs
+> will queue indefinitely otherwise.
 
 ---
 
 ## License
 
-This deployment scaffold is MIT licensed. The LTX-Video-2.5 model weights are subject to [Lightricks' model license](https://huggingface.co/Lightricks/LTX-Video-2-0-5B-Distilled/blob/main/LICENSE).
+This deployment scaffold is MIT licensed. The LTX-2.5 model weights are subject to the [LTX-2.5 Open Weights License](https://huggingface.co/Lightricks/LTX-2.5/blob/main/LICENSE.md).
