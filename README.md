@@ -478,6 +478,20 @@ RUNPOD_VOLUME_PATH=/runpod-volume HF_TOKEN=hf_xxx \
 
 **Cause:** The requested resolution/frames exceeds available VRAM.
 
+> **Already fixed once — autograd.** An earlier build OOMed at 450p/241f on a
+> 48 GB L40S with **43.37 GiB allocated** right after the log line
+> `Text encoder done, building embeddings processor`. That was not a capacity
+> problem: nothing in `ltx_pipelines.utils.blocks` disables gradient tracking
+> (the only guard upstream ships is `@torch.inference_mode()` on the reference
+> CLI's `distilled.main()`, which this repo's handler replaces), so the graph
+> hanging off Gemma's hidden states kept the encoder's ~24 GB alive past
+> `gpu_model()`'s `dispose()`. `src/inference.py` now wraps both the pipeline
+> call and the lazy VAE chunk iterator in `torch.no_grad()`, and `handler()`
+> disables grad for the whole request. If you see a comparable OOM, check the
+> `[inference] VRAM ...` line in the logs first — allocated ≫ expected means a
+> live-tensor leak, not fragmentation, and no
+> `PYTORCH_CUDA_ALLOC_CONF` setting will help.
+
 The 22B transformer dominates VRAM, and how much it needs depends entirely on
 `LTX_QUANTIZATION`:
 
@@ -494,7 +508,13 @@ The 22B transformer dominates VRAM, and how much it needs depends entirely on
 | RTX PRO 6000 (96 GB) | Up to 1080p / 241f                          |
 | H100 80 GB           | Up to 1080p / 121f                          |
 | L40S 48 GB           | 450p / 241f, 720p / 121f; 1080p needs `LTX_OFFLOAD_MODE=cpu` |
-| 24 GB cards          | Not recommended — needs `LTX_OFFLOAD_MODE=cpu` even at 450p |
+| 24 GB cards          | Not recommended — `LTX_OFFLOAD_MODE=auto` streams weights for you, but every pass re-transfers them |
+
+`LTX_OFFLOAD_MODE` defaults to `auto`: weights stay resident on a card with at
+least 44 GiB of VRAM (an L40S reports 44.39 GiB) and stream layer-by-layer from
+pinned host RAM below that, so a smaller GPU gets slower rather than failing.
+Streaming only accepts `bf16` and `fp8-cast` quantization — pairing it with
+`fp8-scaled-mm` or `nvfp4-*` is rejected at load time with an explicit message.
 
 Reduce `resolution` or `num_frames`. Note that `num_inference_steps` has **no
 effect** — the distilled checkpoint runs a fixed 8-step + 3-step schedule — so

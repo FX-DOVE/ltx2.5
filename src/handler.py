@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 import runpod
+import torch
 from loguru import logger
 from pydantic import ValidationError
 
@@ -97,6 +98,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     job_id = job.get("id", "unknown")
     logger.info(f"[handler] Job {job_id} received.")
 
+    # Autograd is dead weight here and actively harmful: the graph keeps the
+    # text encoder's ~24 GB alive past dispose(). inference.py guards its own
+    # scopes; this makes the whole request grad-free even on paths added later.
+    # Set inside handler() rather than at import because the flag is
+    # thread-local and Runpod may dispatch the handler off the import thread.
+    torch.set_grad_enabled(False)
+
     # ── 1. Input validation ───────────────────────────────────────────────────
     try:
         params = InferenceInput.model_validate(job.get("input", {}))
@@ -118,7 +126,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                     "CUDA out of memory. Try a lower 'resolution' or fewer "
                     "'num_frames'. On a 48 GB L40S with fp8-cast quantization, "
                     "450p/241f and 720p/121f fit; 1080p needs short clips or "
-                    "LTX_OFFLOAD_MODE=cpu on the endpoint."
+                    "LTX_OFFLOAD_MODE=cpu on the endpoint (LTX_OFFLOAD_MODE=auto "
+                    "picks that automatically below 44 GiB of VRAM)."
                 ),
                 retryable=False,
             )
@@ -238,14 +247,18 @@ def _encode_video(result: InferenceResult, fps: int, job_id: str) -> bytes:
 
     with tempfile.TemporaryDirectory(prefix="ltx-out-") as tmpdir:
         out_path = Path(tmpdir) / f"{job_id}.mp4"
-        encode_video(
-            video=result.video,
-            fps=fps,
-            audio=result.audio,
-            output_path=str(out_path),
-            video_chunks_number=chunks,
-            crf=_CRF,
-        )
+        # The VAE decode runs *inside* this call as the encoder pulls chunks, so
+        # the grad guard has to cover it too (inference._grad_free_chunks also
+        # guards each pull; this covers the audio path and any future callers).
+        with torch.no_grad():
+            encode_video(
+                video=result.video,
+                fps=fps,
+                audio=result.audio,
+                output_path=str(out_path),
+                video_chunks_number=chunks,
+                crf=_CRF,
+            )
         if not out_path.exists() or out_path.stat().st_size == 0:
             raise RuntimeError(
                 f"encode_video produced no output at {out_path}. "

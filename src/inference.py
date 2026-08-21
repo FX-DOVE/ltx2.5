@@ -48,6 +48,26 @@ straight to `ltx_pipelines.utils.media_io.encode_video`, which streams chunks
 into libx264 and muxes the audio. Materialising frames as a numpy array would
 defeat the chunked decoder and roughly double peak host memory.
 
+Autograd must be off
+────────────────────
+Nothing in `ltx_pipelines.utils.blocks` disables gradient tracking — the only
+grad guard upstream ships is `@torch.inference_mode()` on the reference CLI's
+`distilled.main()`. Because this module replaces that entrypoint, the guard has
+to be reinstated here, and it is not optional:
+
+`PromptEncoder.__call__` builds Gemma-4-12B (~24.5 GB bf16), encodes, then exits
+the `gpu_model()` context, which calls `dispose()` to move parameter storage to
+meta. With grad enabled, the graph hanging off the returned hidden states still
+references the saved activations and weights, so `dispose()` + `empty_cache()`
+free nothing; building the embeddings processor next then OOMs with ~43 GB still
+*allocated* (not merely reserved — this is live-tensor pressure, which is why
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True does not help).
+
+`torch.no_grad()` is used rather than `torch.inference_mode()`: the pipeline
+returns a *lazy* chunk iterator that PyAV consumes later, in another module, and
+inference-mode tensors that escape their scope raise on in-place mutation.
+`no_grad` sheds the graph just as completely without marking the tensors.
+
 GPU memory notes (NVIDIA L40S, 48 GB VRAM, fp8-cast quantization):
   • 450p (768×448) / 241 frames — comfortable.
   • 720p (1280×704) / 121 frames — fits with the chunked DiffVAE decoder.
@@ -172,18 +192,23 @@ def run_inference(pipeline: object, params: InferenceInput) -> InferenceResult:
     # ── Generate ─────────────────────────────────────────────────────────────
     t0 = time.monotonic()
     try:
-        video, audio, num_frames, tiling_config = pipeline(  # type: ignore[operator]
-            prompt=params.prompt,
-            seed=seed,
-            height=height,
-            width=width,
-            frame_rate=float(params.fps),
-            images=images,
-            num_frames=params.num_frames,
-            tiling_config=AUTO_TILING,
-        )
+        # See "Autograd must be off" in the module docstring: without this the
+        # text encoder's graph pins ~24 GB past dispose() and the embeddings
+        # processor OOMs.
+        with torch.no_grad():
+            video, audio, num_frames, tiling_config = pipeline(  # type: ignore[operator]
+                prompt=params.prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                frame_rate=float(params.fps),
+                images=images,
+                num_frames=params.num_frames,
+                tiling_config=AUTO_TILING,
+            )
     except torch.cuda.OutOfMemoryError as oom:  # type: ignore[attr-defined]
         _discard(tmpdir)
+        _log_vram("at OOM")
         torch.cuda.empty_cache()
         logger.error(f"[inference] CUDA OOM: {oom}")
         raise RuntimeError("out_of_memory") from oom
@@ -197,14 +222,15 @@ def run_inference(pipeline: object, params: InferenceInput) -> InferenceResult:
         raise
 
     # Note: `video` is a lazy iterator — the diffusion work above is done, but
-    # VAE decode happens as the encoder pulls chunks.
+    # VAE decode happens as the encoder pulls chunks, so it needs its own guard.
     logger.info(
         f"[inference] Denoising complete in {time.monotonic() - t0:.1f}s "
         f"({num_frames} frames). Decode streams during encode."
     )
+    _log_vram("after denoising")
 
     return InferenceResult(
-        video=video,
+        video=_grad_free_chunks(video),
         audio=audio,
         num_frames=num_frames,
         tiling_config=tiling_config,
@@ -213,6 +239,53 @@ def run_inference(pipeline: object, params: InferenceInput) -> InferenceResult:
         height=height,
         _tmpdir=tmpdir,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grad / VRAM helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _grad_free_chunks(chunks: Iterator[torch.Tensor]) -> Iterator[torch.Tensor]:
+    """
+    Re-enter `torch.no_grad()` for every pull from the VAE's chunk iterator.
+
+    `DistilledPipeline.__call__` returns the decode lazily: the tensors are
+    produced while `encode_video` iterates, long after `run_inference` has
+    returned and its own `no_grad` scope has closed. Guarding only the call
+    would leave the decoder building a graph over full-resolution frames — the
+    same failure mode as the text encoder, just later.
+
+    The guard is exited before each `yield` so it never leaks into the
+    consumer's frame.
+    """
+    iterator = iter(chunks)
+    while True:
+        with torch.no_grad():
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                return
+        yield chunk
+
+
+def _log_vram(when: str) -> None:
+    """Log allocated/reserved VRAM. Makes an OOM report self-diagnosing."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        gib = 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / gib
+        logger.info(
+            f"[inference] VRAM {when}: "
+            f"allocated={torch.cuda.memory_allocated() / gib:.2f} GiB | "
+            f"reserved={torch.cuda.memory_reserved() / gib:.2f} GiB | "
+            f"peak={torch.cuda.max_memory_allocated() / gib:.2f} GiB | "
+            f"total={total:.2f} GiB"
+        )
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:  # diagnostics must never break a request
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

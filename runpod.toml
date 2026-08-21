@@ -105,8 +105,11 @@ LTX_TRANSFORMER = "distilled"
 # LTX_QUANTIZATION: fp8-cast | fp8-scaled-mm | nvfp4-cast | nvfp4-prequant | none
 # fp8-cast is required on a 48 GB L40S — bf16 alone is ~39 GB.
 LTX_QUANTIZATION = "fp8-cast"
-# LTX_OFFLOAD_MODE: none | cpu | disk.  Switch to "cpu" for 1080p.
-LTX_OFFLOAD_MODE = "none"
+# LTX_OFFLOAD_MODE: auto | none | cpu | disk.  "auto" keeps weights resident on
+# a >= 44 GiB card (an L40S reports 44.39 GiB) and streams them layer-by-layer
+# below that, so a smaller GPU degrades in speed instead of OOMing.  Force "cpu"
+# for 1080p on 48 GB.  Streaming only accepts bf16 / fp8-cast quantization.
+LTX_OFFLOAD_MODE = "auto"
 # LTX_VIDEO_VAE: auto | conv | diffusion.  "auto" prefers the conv VAE when it
 # is on the volume; the DiffVAE wants `natten`, which cannot be built against
 # torch 2.8, so it runs a slower Triton/eager fallback.

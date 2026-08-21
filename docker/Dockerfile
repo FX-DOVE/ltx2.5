@@ -60,12 +60,17 @@ ENV MODEL_ID=Lightricks/LTX-2.5 \
 
 # Required by the LTX optimisation docs: without expandable segments the 22B
 # transformer fragments the CUDA allocator and OOMs mid-decode on a 48 GB L40S.
+# Note this only addresses *fragmentation* — the inference-time OOM fixed in
+# src/inference.py was live autograd-graph pressure, which no allocator setting
+# can reclaim.
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # fp8-cast is the only quantization usable on an L40S (sm_89): nvfp4 requires
 # Blackwell (sm_100+) plus compiled ltx-kernels. ~19.6 GB vs 39.1 GB for bf16.
+# It is also one of the two fuse rules that weight streaming accepts, so it
+# stays valid if LTX_OFFLOAD_MODE=auto selects cpu/disk on a smaller card.
 ENV LTX_QUANTIZATION=fp8-cast \
-    LTX_OFFLOAD_MODE=none \
+    LTX_OFFLOAD_MODE=auto \
     LTX_DIFFVAE_MODE=chunked_eager \
     LTX_TRANSFORMER=distilled
 

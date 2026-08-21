@@ -187,7 +187,8 @@ def load_pipeline() -> object:
       LTX_TRANSFORMER   distilled | distilled-nvfp4 | dev   (default: distilled)
       LTX_QUANTIZATION  none | fp8-cast | fp8-scaled-mm |
                         nvfp4-cast | nvfp4-prequant          (default: fp8-cast)
-      LTX_OFFLOAD_MODE  none | cpu | disk                    (default: none)
+      LTX_OFFLOAD_MODE  auto | none | cpu | disk               (default: auto)
+                        auto = none on a >= 44 GiB card, else cpu/disk.
       LTX_DIFFVAE_MODE  chunked_eager | chunked_compile |
                         combined_compile | blackwell_dsl      (default: chunked_eager)
       LTX_VIDEO_VAE     auto | diffusion | conv               (default: auto)
@@ -252,10 +253,9 @@ def load_pipeline() -> object:
 
         # ── Resolve runtime knobs ────────────────────────────────────────────
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        quantization_raw = os.environ.get("LTX_QUANTIZATION", "fp8-cast")
         quantization = _resolve_quantization(QuantizationKind, transformer_path)
-        offload_mode = _resolve_enum(
-            OffloadMode, os.environ.get("LTX_OFFLOAD_MODE", "none"), "LTX_OFFLOAD_MODE"
-        )
+        offload_mode = _resolve_offload_mode(OffloadMode, quantization_raw)
         diffvae_mode = _resolve_enum(
             DiffVAEMode,
             os.environ.get("LTX_DIFFVAE_MODE", "chunked_eager"),
@@ -264,14 +264,16 @@ def load_pipeline() -> object:
 
         logger.info(
             "[model_loader] transformer={} | text_encoder={} | video_vae={}\n"
-            "[model_loader] quantization={} | offload={} | diffvae={} | device={}".format(
+            "[model_loader] quantization={} | offload={} | diffvae={} | device={}"
+            " | vram={:.1f} GiB".format(
                 transformer_path.name,
                 text_encoder_path.name,
                 video_vae_path.name,
-                os.environ.get("LTX_QUANTIZATION", "fp8-cast"),
+                quantization_raw,
                 offload_mode.value,
                 diffvae_mode.value,
                 device,
+                _total_vram_gib(),
             )
         )
 
@@ -471,6 +473,107 @@ def _resolve_enum(enum_cls: type, raw: str, env_name: str):
         raise RuntimeError(
             f"{env_name}='{raw}' is not recognised. Valid values: {valid}"
         ) from exc
+
+
+# Below this much total VRAM, `LTX_OFFLOAD_MODE=auto` streams weights instead of
+# keeping them resident. A 48 GB L40S reports ~44.39 GiB, so the threshold sits
+# just under it: with autograd off (see inference.py) the resident peak is the
+# bf16 text encoder at ~25 GiB, which such a card holds comfortably.
+_OFFLOAD_NONE_MIN_GIB = 44.0
+
+# OffloadMode.CPU pins the full weight set in host RAM (upstream budgets ~36 GB
+# for LTX-2). With less than this, DISK re-reads from the volume instead.
+_OFFLOAD_CPU_MIN_HOST_GIB = 48.0
+
+# `StreamingModelBuilder` rejects any quantization whose fuse rule is neither
+# bf16 nor fp8-cast (ltx_pipelines.utils.blocks._build_streaming_builder), so
+# offloading is incompatible with these. Caught here instead of deep in a build.
+_NON_STREAMABLE_QUANTIZATIONS = ("fp8-scaled-mm", "nvfp4")
+
+
+def _total_vram_gib() -> float:
+    """Total VRAM on device 0 in GiB, or 0.0 when there is no CUDA device."""
+    if not torch.cuda.is_available():
+        return 0.0
+    try:
+        return torch.cuda.get_device_properties(0).total_memory / 1024**3
+    except Exception:
+        return 0.0
+
+
+def _total_host_ram_gib() -> float:
+    """Total host RAM in GiB, or 0.0 when it cannot be determined."""
+    try:
+        import psutil
+
+        return psutil.virtual_memory().total / 1024**3
+    except Exception:
+        return 0.0
+
+
+def _resolve_offload_mode(offload_mode_cls: type, quantization_raw: str):
+    """
+    Resolve LTX_OFFLOAD_MODE, including the `auto` default.
+
+    `auto` keeps every weight resident (OffloadMode.NONE — fastest) on cards with
+    at least ~44 GiB of VRAM, and streams layer-by-layer from pinned host RAM
+    (OffloadMode.CPU) below that, falling back to DISK when the host does not
+    have the ~36-48 GB of RAM that CPU offload pins. Explicit values are always
+    honoured; `auto` exists so a smaller card degrades instead of OOMing.
+
+    Streaming rejects quantizations that are neither bf16 nor fp8-cast, so an
+    incompatible pairing is rejected here with an actionable message.
+    """
+    raw = os.environ.get("LTX_OFFLOAD_MODE", "auto").strip().lower()
+
+    if raw in ("", "auto"):
+        vram = _total_vram_gib()
+        if vram == 0.0:
+            mode = offload_mode_cls("none")
+            logger.info(
+                "[model_loader] LTX_OFFLOAD_MODE=auto: no CUDA device detected — "
+                "using offload=none (CPU inference)."
+            )
+        elif vram >= _OFFLOAD_NONE_MIN_GIB:
+            mode = offload_mode_cls("none")
+            logger.info(
+                f"[model_loader] LTX_OFFLOAD_MODE=auto: {vram:.1f} GiB VRAM "
+                f">= {_OFFLOAD_NONE_MIN_GIB:.0f} GiB — keeping weights resident "
+                "(offload=none, fastest)."
+            )
+        else:
+            host = _total_host_ram_gib()
+            if 0.0 < host < _OFFLOAD_CPU_MIN_HOST_GIB:
+                mode = offload_mode_cls("disk")
+                logger.warning(
+                    f"[model_loader] LTX_OFFLOAD_MODE=auto: {vram:.1f} GiB VRAM and "
+                    f"only {host:.1f} GiB host RAM — streaming from disk "
+                    "(offload=disk). Expect slow generation; every pass re-reads "
+                    "the checkpoint."
+                )
+            else:
+                mode = offload_mode_cls("cpu")
+                logger.warning(
+                    f"[model_loader] LTX_OFFLOAD_MODE=auto: {vram:.1f} GiB VRAM "
+                    f"< {_OFFLOAD_NONE_MIN_GIB:.0f} GiB — streaming weights from "
+                    "host RAM (offload=cpu). Slower than resident weights but it "
+                    "fits; a >= 48 GB GPU avoids this."
+                )
+    else:
+        mode = _resolve_enum(offload_mode_cls, raw, "LTX_OFFLOAD_MODE")
+
+    if mode.value != "none":
+        quant = (quantization_raw or "").strip().lower()
+        for blocked in _NON_STREAMABLE_QUANTIZATIONS:
+            if blocked in quant:
+                raise RuntimeError(
+                    f"LTX_OFFLOAD_MODE={mode.value!r} streams weights layer by "
+                    f"layer, which only supports bf16 and fp8-cast fuse rules, "
+                    f"but LTX_QUANTIZATION={quantization_raw!r}. Use "
+                    "LTX_QUANTIZATION=fp8-cast, or LTX_OFFLOAD_MODE=none."
+                )
+
+    return mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
