@@ -278,8 +278,9 @@ class TestHandlerUnit(unittest.TestCase):
         self.assertAlmostEqual(result["duration_seconds"], round(121 / 24, 2))
 
     def test_large_video_is_uploaded_not_base64(self):
-        """Outputs above the base64 threshold go to object storage."""
+        """Under `size` mode, outputs above the threshold go to object storage."""
         h = self._get_handler()
+        h._UPLOAD_MODE = "size"
         h._encode_video = MagicMock(return_value=b"\x00" * (h._MAX_BASE64_BYTES + 1))
 
         result = h.handler(_make_job({"prompt": "test"}))
@@ -290,6 +291,7 @@ class TestHandlerUnit(unittest.TestCase):
     def test_upload_failure_falls_back_to_base64(self):
         """A storage outage should degrade to base64 rather than fail the job."""
         h = self._get_handler()
+        h._UPLOAD_MODE = "size"
         h._encode_video = MagicMock(return_value=b"\x00" * (h._MAX_BASE64_BYTES + 1))
         h._upload_video = MagicMock(side_effect=RuntimeError("no bucket configured"))
 
@@ -301,30 +303,75 @@ class TestHandlerUnit(unittest.TestCase):
 
     # ── Delivery mode (LTX_UPLOAD_MODE) ───────────────────────────────────────
 
-    def test_small_video_is_inlined_under_auto(self):
-        """`auto` is size-driven, so a sub-threshold clip must not be uploaded.
+    def test_auto_uploads_a_tiny_video_when_a_bucket_is_configured(self):
+        """The actual bug: a configured bucket must receive even a small clip.
 
-        This is why the R2 path looked broken: at 450p a 10-second clip encodes
-        to under a megabyte, so `auto` never reached the uploader.
+        A 10-second 450p clip is ~0.7 MB, so the old size-only rule meant a
+        fully working R2 config never saw a single upload.
         """
         h = self._get_handler()
         h._encode_video = MagicMock(return_value=b"\x00" * 1024)
         h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
 
-        result = h.handler(_make_job({"prompt": "test"}))
+        with patch.dict(os.environ, {"S3_BUCKET": "cineforge"}):
+            result = h.handler(_make_job({"prompt": "test"}))
 
-        self.assertNotIn("video_url", result)
+        self.assertEqual(result["video_url"], "https://example.com/video.mp4")
+        self.assertNotIn("video_base64", result)
+        h._upload_video.assert_called_once()
+
+    def test_auto_inlines_when_no_storage_is_configured(self):
+        """With nowhere to upload, `auto` must not attempt one."""
+        h = self._get_handler()
+        h._encode_video = MagicMock(return_value=b"\x00" * 1024)
+        h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("S3_BUCKET", None)
+            os.environ.pop("BUCKET_ENDPOINT_URL", None)
+            result = h.handler(_make_job({"prompt": "test"}))
+
         self.assertIn("video_base64", result)
+        self.assertNotIn("video_url", result)
         h._upload_video.assert_not_called()
 
-    def test_always_uploads_even_a_tiny_video(self):
-        """`always` must reach storage regardless of size."""
+    def test_auto_honours_the_runpod_bucket_too(self):
+        """Runpod's own bucket helper counts as configured storage."""
+        h = self._get_handler()
+        h._encode_video = MagicMock(return_value=b"\x00" * 1024)
+        h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
+
+        with patch.dict(os.environ, {"BUCKET_ENDPOINT_URL": "https://example.com"}):
+            os.environ.pop("S3_BUCKET", None)
+            result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["video_url"], "https://example.com/video.mp4")
+
+    def test_size_mode_inlines_a_small_video(self):
+        """`size` preserves the original threshold-driven behaviour."""
+        h = self._get_handler()
+        h._UPLOAD_MODE = "size"
+        h._encode_video = MagicMock(return_value=b"\x00" * 1024)
+        h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
+
+        with patch.dict(os.environ, {"S3_BUCKET": "cineforge"}):
+            result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertIn("video_base64", result)
+        self.assertNotIn("video_url", result)
+        h._upload_video.assert_not_called()
+
+    def test_always_uploads_with_no_bucket_configured(self):
+        """`always` reaches the uploader unconditionally, so its error surfaces."""
         h = self._get_handler()
         h._UPLOAD_MODE = "always"
         h._encode_video = MagicMock(return_value=b"\x00" * 1024)
         h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
 
-        result = h.handler(_make_job({"prompt": "test"}))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("S3_BUCKET", None)
+            os.environ.pop("BUCKET_ENDPOINT_URL", None)
+            result = h.handler(_make_job({"prompt": "test"}))
 
         self.assertEqual(result["video_url"], "https://example.com/video.mp4")
         self.assertNotIn("video_base64", result)
@@ -337,7 +384,8 @@ class TestHandlerUnit(unittest.TestCase):
         h._encode_video = MagicMock(return_value=b"\x00" * (h._MAX_BASE64_BYTES + 1))
         h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
 
-        result = h.handler(_make_job({"prompt": "test"}))
+        with patch.dict(os.environ, {"S3_BUCKET": "cineforge"}):
+            result = h.handler(_make_job({"prompt": "test"}))
 
         self.assertIn("video_base64", result)
         self.assertNotIn("video_url", result)
@@ -366,8 +414,9 @@ class TestHandlerUnit(unittest.TestCase):
         self.assertEqual(result["size_bytes"], 4242)
 
     def test_threshold_is_read_from_the_environment(self):
-        """LTX_MAX_BASE64_MB has to move the auto cutoff, or it is not tunable."""
-        with patch.dict(os.environ, {"LTX_MAX_BASE64_MB": "0.001"}):
+        """LTX_MAX_BASE64_MB has to move the `size` cutoff, or it is not tunable."""
+        with patch.dict(os.environ, {"LTX_MAX_BASE64_MB": "0.001",
+                                     "LTX_UPLOAD_MODE": "size"}):
             h = self._get_handler()
             self.assertEqual(h._MAX_BASE64_BYTES, int(0.001 * 1024 * 1024))
             h._encode_video = MagicMock(return_value=b"\x00" * 4096)

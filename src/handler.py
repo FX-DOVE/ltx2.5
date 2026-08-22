@@ -16,7 +16,8 @@ Per-request sequence:
      `ltx_pipelines.utils.media_io.encode_video` (PyAV/libx264). This is the
      same encoder the reference CLI uses, so the chunked VAE decoder is
      consumed lazily and the generated audio is not lost.
-  4. Upload to S3/R2 (or return base64 for small outputs).
+  4. Deliver: upload to S3/R2 when storage is configured, else inline base64.
+     LTX_UPLOAD_MODE=auto|size|always|never overrides the choice.
   5. Return structured JSON.
 
 Error handling:
@@ -72,35 +73,48 @@ logger.info(
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# How the finished MP4 gets back to the caller:
+# How the finished MP4 gets back to the caller. LTX_UPLOAD_MODE:
 #
-#   auto   (default) — upload only when the clip exceeds _MAX_BASE64_BYTES.
-#   always           — upload whenever object storage is configured.
+#   auto   (default) — upload whenever object storage is configured, else base64.
+#   size             — upload only when the clip exceeds _MAX_BASE64_BYTES.
+#   always           — upload; base64 only if the upload itself fails.
 #   never            — always inline base64, never touch storage.
 #
-# `auto` is the historical behaviour, and at 450p a 10-second clip encodes to
-# well under a megabyte, so `auto` means the upload path is effectively never
-# taken. Set LTX_UPLOAD_MODE=always on the endpoint to get a URL every time.
+# `size` was the original behaviour and is the reason the R2 path looked broken:
+# a 10-second 450p clip encodes to ~0.7 MB, far below any sane threshold, so the
+# uploader was never reached. Configuring a bucket is a clear statement that you
+# want the video in it, so `auto` now honours that.
 _UPLOAD_MODE = os.environ.get("LTX_UPLOAD_MODE", "auto").strip().lower()
+_UPLOAD_MODES = ("auto", "size", "always", "never")
 
-# Size above which `auto` switches to uploading. Base64 adds ~33% overhead and
-# Runpod caps a job result at 20 MB, so the default stays conservative.
+# Size above which `size` mode switches to uploading. Base64 adds ~33% overhead
+# and Runpod caps a job result at 20 MB, so the default stays conservative.
 _MAX_BASE64_BYTES = int(float(os.environ.get("LTX_MAX_BASE64_MB", "5")) * 1024 * 1024)
 
 # libx264 constant rate factor for the output MP4 (upstream default is 19).
 _CRF = int(os.environ.get("LTX_CRF", "19"))
 
-if _UPLOAD_MODE not in ("auto", "always", "never"):
+if _UPLOAD_MODE not in _UPLOAD_MODES:
     logger.warning(
         f"[handler] LTX_UPLOAD_MODE={_UPLOAD_MODE!r} is not one of "
-        "auto/always/never — falling back to 'auto'."
+        f"{'/'.join(_UPLOAD_MODES)} — falling back to 'auto'."
     )
     _UPLOAD_MODE = "auto"
 
+
+def _storage_backend() -> str:
+    """Which upload backend `_upload_video` would pick, or 'none'."""
+    if os.environ.get("S3_BUCKET"):
+        return "s3"
+    if os.environ.get("BUCKET_ENDPOINT_URL"):
+        return "runpod"
+    return "none"
+
+
 logger.info(
     f"[handler] delivery: upload_mode={_UPLOAD_MODE} | "
-    f"base64 threshold={_MAX_BASE64_BYTES / 1e6:.1f} MB | "
-    f"storage={'s3' if os.environ.get('S3_BUCKET') else ('runpod' if os.environ.get('BUCKET_ENDPOINT_URL') else 'none')}"
+    f"storage={_storage_backend()} | "
+    f"size-mode threshold={_MAX_BASE64_BYTES / 1e6:.1f} MB"
 )
 
 
@@ -206,8 +220,10 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         want_upload = False
     elif _UPLOAD_MODE == "always":
         want_upload = True
-    else:
+    elif _UPLOAD_MODE == "size":
         want_upload = len(video_bytes) > _MAX_BASE64_BYTES
+    else:  # auto
+        want_upload = _storage_backend() != "none"
 
     if want_upload:
         t_upload = time.monotonic()

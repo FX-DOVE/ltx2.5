@@ -253,7 +253,7 @@ class InferenceOutput(BaseModel):
         default=None,
         description=(
             "Size of the encoded MP4. Also explains the delivery choice under "
-            "LTX_UPLOAD_MODE=auto, which uploads only above LTX_MAX_BASE64_MB."
+            "LTX_UPLOAD_MODE=size, which uploads only above LTX_MAX_BASE64_MB."
         ),
     )
 
