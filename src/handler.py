@@ -169,6 +169,9 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         return _error_response("encoding_error", f"Video encoding failed: {exc}", False)
 
     generation_time = time.monotonic() - t_inference_start
+    # Phase attribution, logged here because the VAE decode is lazy: it happens
+    # inside the encode step above, not inside run_inference.
+    inference_module.log_phase_report(generation_time)
 
     # ── 4. Upload or base64 ───────────────────────────────────────────────────
     duration_s = result.num_frames / params.fps
@@ -243,6 +246,8 @@ def _encode_video(result: InferenceResult, fps: int, job_id: str) -> bytes:
     from ltx_core.model.video_vae import get_video_chunks_number
     from ltx_pipelines.utils.media_io import encode_video
 
+    import perf
+
     chunks = get_video_chunks_number(result.num_frames, result.tiling_config)
 
     with tempfile.TemporaryDirectory(prefix="ltx-out-") as tmpdir:
@@ -250,7 +255,9 @@ def _encode_video(result: InferenceResult, fps: int, job_id: str) -> bytes:
         # The VAE decode runs *inside* this call as the encoder pulls chunks, so
         # the grad guard has to cover it too (inference._grad_free_chunks also
         # guards each pull; this covers the audio path and any future callers).
-        with torch.no_grad():
+        # The timer covers decode + libx264; the decoder's own share is reported
+        # separately as `video_decoder:drain`.
+        with torch.no_grad(), perf.time_phase("encode_video(+vae decode)"):
             encode_video(
                 video=result.video,
                 fps=fps,

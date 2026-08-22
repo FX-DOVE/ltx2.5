@@ -192,6 +192,14 @@ def load_pipeline() -> object:
       LTX_DIFFVAE_MODE  chunked_eager | chunked_compile |
                         combined_compile | blackwell_dsl      (default: chunked_eager)
       LTX_VIDEO_VAE     auto | diffusion | conv               (default: auto)
+      LTX_WEIGHT_CACHE  auto | on | off                       (default: auto)
+                        Keep checkpoint weights in host RAM between the ~8
+                        model builds each request performs, instead of re-reading
+                        them from the network volume. auto = on when the host has
+                        the RAM for it.
+      LTX_ALLOC_TRIM    auto | trim | defer                   (default: auto)
+                        defer skips synchronize + empty_cache on every block
+                        exit. auto = defer when weights are resident, else trim.
     """
     global _pipeline
     weights_dir = get_weights_dir()
@@ -206,6 +214,7 @@ def load_pipeline() -> object:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
     from ltx_core.model.video_vae.transformer import DiffVAEMode
     from ltx_pipelines.distilled import DistilledPipeline
     from ltx_pipelines.utils.model_paths import ModelPaths
@@ -277,16 +286,27 @@ def load_pipeline() -> object:
             )
         )
 
+        registry = _build_weight_cache(offload_mode)
+        alloc_trim = _resolve_alloc_trim(AllocatorTrimStrategy, offload_mode)
+
         pipeline = DistilledPipeline(
             model_paths=model_paths,
             spatial_upsampler_path=str(spatial_upscaler_path),
             loras=[],
             device=device,
             quantization=quantization,
+            registry=registry,
             compilation_config=None,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim,
             diffvae_optimization=diffvae_mode,
         )
+
+        # Per-phase timers, and the lazy VAE-encoder build that removes two
+        # unused encoder builds from every text-to-video request.
+        from perf import instrument_pipeline
+
+        instrument_pipeline(pipeline)
 
         _pipeline = pipeline
         elapsed = time.monotonic() - t0
@@ -508,7 +528,158 @@ def _total_host_ram_gib() -> float:
 
         return psutil.virtual_memory().total / 1024**3
     except Exception:
-        return 0.0
+        return _meminfo_gib("MemTotal")
+
+
+def _available_host_ram_gib() -> float:
+    """Host RAM available right now, in GiB, or 0.0 when unknown."""
+    try:
+        import psutil
+
+        return psutil.virtual_memory().available / 1024**3
+    except Exception:
+        return _meminfo_gib("MemAvailable")
+
+
+def _meminfo_gib(field: str) -> float:
+    """
+    Fallback probe for a `/proc/meminfo` field, in GiB.
+
+    psutil is declared in requirements.txt, but the RAM probes gate real
+    decisions (CPU offload, weight cache), and returning 0.0 makes both take
+    the pessimistic branch silently. The container is Linux, so /proc/meminfo
+    is a reliable second source.
+    """
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith(f"{field}:"):
+                    return int(line.split()[1]) / 1024**2  # kB → GiB
+    except Exception:
+        pass
+    return 0.0
+
+
+# ── Host-RAM weight cache ────────────────────────────────────────────────────
+# Host RAM left untouched for the process, PyAV, and page cache.
+_WEIGHT_CACHE_RESERVE_GIB = 24.0
+# The working set that actually matters is Gemma-4-12B bf16 (~24.5 GiB) plus the
+# fp8-cast transformer (~19.6 GiB); below this there is no point admitting the
+# two dominant checkpoints and thrashing on the rest.
+_WEIGHT_CACHE_MIN_BUDGET_GIB = 56.0
+# Hard floor applied even to `LTX_WEIGHT_CACHE=on`. Roughly the fp8-cast
+# transformer alone; under it the cache cannot hold a single useful checkpoint.
+_WEIGHT_CACHE_FLOOR_GIB = 20.0
+
+
+def _build_weight_cache(offload_mode: object):
+    """
+    Build the host-RAM weight cache, or return None to keep upstream's default.
+
+    Every block in `ltx_pipelines.utils.blocks` defaults to
+    `ModelRegistry(cache_models=True, cache_weights=False)`, so weights are
+    re-read from the checkpoint on each of the ~8 builds a request performs —
+    from a *network* volume, on RunPod. Retaining them in host RAM turns those
+    reads into PCIe copies.
+
+    `auto` only enables it with `offload=none`: the streaming builders used for
+    CPU/DISK offload already hold or stream weights from the host, so a second
+    host-side copy would compete with them for the same RAM.
+    """
+    raw = os.environ.get("LTX_WEIGHT_CACHE", "auto").strip().lower()
+    if raw not in ("auto", "on", "off", "1", "0", "true", "false"):
+        raise RuntimeError(
+            f"LTX_WEIGHT_CACHE={raw!r} is not recognised. Use auto, on or off."
+        )
+    if raw in ("off", "0", "false"):
+        logger.info("[model_loader] LTX_WEIGHT_CACHE=off — weights re-read per build.")
+        return None
+
+    resident = getattr(offload_mode, "value", str(offload_mode)) == "none"
+    available = _available_host_ram_gib()
+    budget = max(0.0, available - _WEIGHT_CACHE_RESERVE_GIB)
+
+    if raw == "auto":
+        if not resident:
+            logger.info(
+                "[model_loader] LTX_WEIGHT_CACHE=auto: offload is streaming from the "
+                "host already — leaving the weight cache off to avoid a second copy."
+            )
+            return None
+        if budget < _WEIGHT_CACHE_MIN_BUDGET_GIB:
+            logger.info(
+                f"[model_loader] LTX_WEIGHT_CACHE=auto: {available:.0f} GiB host RAM "
+                f"available leaves a {budget:.0f} GiB budget, under the "
+                f"{_WEIGHT_CACHE_MIN_BUDGET_GIB:.0f} GiB the text encoder plus "
+                "transformer need — weight cache off."
+            )
+            return None
+    elif not resident:
+        logger.warning(
+            "[model_loader] LTX_WEIGHT_CACHE=on with host offload active — the "
+            "streaming builder already keeps weights host-side; watch RAM."
+        )
+
+    # `on` overrides the 56 GiB heuristic, but not physics: a cache that cannot
+    # hold anything is worse than no cache, because it pays the device→host copy
+    # and then refuses the entry.
+    if budget < _WEIGHT_CACHE_FLOOR_GIB:
+        logger.warning(
+            f"[model_loader] weight cache off: {available:.0f} GiB host RAM available "
+            f"leaves only {budget:.0f} GiB after the {_WEIGHT_CACHE_RESERVE_GIB:.0f} GiB "
+            "reserve — not enough to retain a checkpoint."
+        )
+        return None
+
+    from weight_cache import HostWeightCacheRegistry
+
+    pin = os.environ.get("LTX_WEIGHT_CACHE_PIN", "0").strip().lower() in ("1", "true", "on")
+    logger.info(
+        f"[model_loader] weight cache on: {budget:.0f} GiB budget of "
+        f"{available:.0f} GiB available host RAM (pinned={pin})."
+    )
+    return HostWeightCacheRegistry(budget_bytes=int(budget * 1024**3), pin=pin)
+
+
+def _resolve_alloc_trim(strategy_cls: type, offload_mode: object):
+    """
+    Resolve LTX_ALLOC_TRIM.
+
+    `AllocatorTrimStrategy.TRIM` — upstream's default — runs
+    `synchronize_device()`, `dispose()` and `cleanup_memory()` on every
+    `gpu_model()` exit, so a request that builds eight models pays eight full
+    `empty_cache()` round trips and hands the freed blocks back to the driver
+    only to ask for them again seconds later. `DEFER` keeps `dispose()` and
+    skips the sync and the cache flush.
+
+    `auto` defers only when weights are resident on a card with room to spare:
+    with a smaller card the allocator wants the OS-level release, and
+    `expandable_segments:True` is what makes keeping the pool safe here.
+    """
+    raw = os.environ.get("LTX_ALLOC_TRIM", "auto").strip().lower()
+    if raw == "trim":
+        return strategy_cls("trim")
+    if raw == "defer":
+        return strategy_cls("defer")
+    if raw != "auto":
+        raise RuntimeError(
+            f"LTX_ALLOC_TRIM={raw!r} is not recognised. Use auto, trim or defer."
+        )
+
+    resident = getattr(offload_mode, "value", str(offload_mode)) == "none"
+    vram = _total_vram_gib()
+    if resident and vram >= _OFFLOAD_NONE_MIN_GIB:
+        logger.info(
+            f"[model_loader] LTX_ALLOC_TRIM=auto: {vram:.1f} GiB VRAM with weights "
+            "resident — deferring allocator trims (keeps the CUDA pool warm across "
+            "builds)."
+        )
+        return strategy_cls("defer")
+    logger.info(
+        "[model_loader] LTX_ALLOC_TRIM=auto: trimming the allocator on every block "
+        "exit (streaming offload or a card without spare VRAM)."
+    )
+    return strategy_cls("trim")
 
 
 def _resolve_offload_mode(offload_mode_cls: type, quantization_raw: str):

@@ -63,3 +63,7 @@ boto3>=1.34.0
 requests>=2.32.0
 tqdm>=4.66.0
 loguru>=0.7.2
+# Host RAM probe. model_loader reads total/available RAM to decide whether the
+# LTX_OFFLOAD_MODE=auto fallback can use CPU offload and whether the host-RAM
+# weight cache fits; both silently take the pessimistic branch without it.
+psutil>=5.9.0

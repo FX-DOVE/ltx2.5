@@ -20,11 +20,14 @@ call signature of `ltx_pipelines.distilled.DistilledPipeline.__call__`:
 
 Notes on what the pipeline does NOT accept
 ──────────────────────────────────────────
-The distilled checkpoint is guidance-distilled with a baked-in sigma schedule
-(8 steps in stage 1, 3 in stage 2), so there is no `negative_prompt`,
-`num_inference_steps` or `guidance_scale` kwarg. Passing them raises
-TypeError. The schema still accepts those fields for API compatibility; they
-are ignored here.
+The distilled checkpoint is guidance-distilled, so there is no
+`negative_prompt`, `num_inference_steps` or `guidance_scale` kwarg. Passing them
+raises TypeError. The schema still accepts those fields for API compatibility;
+they are ignored here.
+
+The step count is not fixed, though: `stage_1_sigmas` / `stage_2_sigmas` *are*
+kwargs, defaulting to the tuned distilled schedules (8 steps then 3). See
+`_sigma_overrides` for the opt-in env override and why it is opt-in.
 
 Conditioning
 ────────────
@@ -78,6 +81,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import random
 import shutil
 import tempfile
@@ -90,6 +94,7 @@ import torch
 from loguru import logger
 from PIL import Image, UnidentifiedImageError
 
+import perf
 from schema import RESOLUTION_MAP, GenerationMode, InferenceInput
 
 
@@ -190,6 +195,7 @@ def run_inference(pipeline: object, params: InferenceInput) -> InferenceResult:
             raise
 
     # ── Generate ─────────────────────────────────────────────────────────────
+    perf.LEDGER.reset()
     t0 = time.monotonic()
     try:
         # See "Autograd must be off" in the module docstring: without this the
@@ -205,6 +211,7 @@ def run_inference(pipeline: object, params: InferenceInput) -> InferenceResult:
                 images=images,
                 num_frames=params.num_frames,
                 tiling_config=AUTO_TILING,
+                **_sigma_overrides(),
             )
     except torch.cuda.OutOfMemoryError as oom:  # type: ignore[attr-defined]
         _discard(tmpdir)
@@ -239,6 +246,81 @@ def run_inference(pipeline: object, params: InferenceInput) -> InferenceResult:
         height=height,
         _tmpdir=tmpdir,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sigma schedules
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SIGMA_ENV = {
+    "stage_1_sigmas": "LTX_STAGE1_SIGMAS",
+    "stage_2_sigmas": "LTX_STAGE2_SIGMAS",
+}
+
+
+def _sigma_overrides() -> dict[str, torch.Tensor]:
+    """
+    Optional replacements for the distilled denoising schedules.
+
+    `DistilledPipeline.__call__` takes `stage_1_sigmas` / `stage_2_sigmas` as
+    kwargs; only the schema's `num_inference_steps` field is ignored. Upstream's
+    defaults are:
+
+        stage 1: 1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0
+        stage 2: 0.909375, 0.725, 0.421875, 0
+
+    i.e. 8 steps then 3. Four of stage 1's eight steps cover the span from 1.0 to
+    0.975 — 2.5% of the trajectory for half the stage's compute — so trimming
+    them is the obvious place to buy time. It is left opt-in because upstream
+    says these values "were tuned to match the distillation process", and a
+    distilled model asked for sigmas it never trained on degrades rather than
+    just running faster. Measure output quality before keeping an override.
+
+    Stage 2's first value doubles as `noise_scale` for the refinement pass, so
+    changing it changes how much noise is re-injected, not only the step count.
+
+    Format: comma-separated descending floats ending at 0, e.g.
+        LTX_STAGE1_SIGMAS="1.0,0.975,0.909375,0.725,0.421875,0.0"
+    """
+    overrides: dict[str, torch.Tensor] = {}
+    for kwarg, env in _SIGMA_ENV.items():
+        raw = os.environ.get(env, "").strip()
+        if not raw:
+            continue
+        values = _parse_sigmas(raw, env)
+        overrides[kwarg] = torch.tensor(values, dtype=torch.float32)
+        logger.info(
+            f"[inference] {env} override: {len(values) - 1} steps {values}"
+        )
+    return overrides
+
+
+def _parse_sigmas(raw: str, env: str) -> list[float]:
+    """Parse and validate a schedule, refusing anything the sampler cannot walk."""
+    try:
+        values = [float(part) for part in raw.replace(" ", "").split(",") if part]
+    except ValueError as exc:
+        raise RuntimeError(f"{env}: not a comma-separated list of floats: {raw!r}") from exc
+    if len(values) < 2:
+        raise RuntimeError(f"{env}: need at least two values (start and 0.0), got {values}")
+    if values[-1] != 0.0:
+        raise RuntimeError(f"{env}: must end at 0.0, got {values[-1]}")
+    if not all(0.0 <= value <= 1.0 for value in values):
+        raise RuntimeError(f"{env}: every sigma must be within [0.0, 1.0], got {values}")
+    if any(later >= earlier for earlier, later in zip(values, values[1:])):
+        raise RuntimeError(f"{env}: values must strictly decrease, got {values}")
+    return values
+
+
+def log_phase_report(wall_seconds: float | None = None) -> None:
+    """
+    Log the per-phase breakdown for the request that just finished.
+
+    Called by the handler *after* encoding, because the VAE decode is lazy —
+    `run_inference` returns before any frame exists, and the decode cost only
+    lands as `encode_video` pulls chunks.
+    """
+    perf.LEDGER.report(wall_seconds)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
