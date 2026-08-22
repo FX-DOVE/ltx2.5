@@ -249,6 +249,13 @@ class InferenceOutput(BaseModel):
         default=False,
         description="True when LTX-2.5 generated an audio track that was muxed into the MP4.",
     )
+    size_bytes: Optional[int] = Field(
+        default=None,
+        description=(
+            "Size of the encoded MP4. Also explains the delivery choice under "
+            "LTX_UPLOAD_MODE=auto, which uploads only above LTX_MAX_BASE64_MB."
+        ),
+    )
 
 
 class ErrorOutput(BaseModel):

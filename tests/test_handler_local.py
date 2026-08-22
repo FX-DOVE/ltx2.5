@@ -299,6 +299,91 @@ class TestHandlerUnit(unittest.TestCase):
         self.assertIn("video_base64", result)
         self.assertNotIn("video_url", result)
 
+    # ── Delivery mode (LTX_UPLOAD_MODE) ───────────────────────────────────────
+
+    def test_small_video_is_inlined_under_auto(self):
+        """`auto` is size-driven, so a sub-threshold clip must not be uploaded.
+
+        This is why the R2 path looked broken: at 450p a 10-second clip encodes
+        to under a megabyte, so `auto` never reached the uploader.
+        """
+        h = self._get_handler()
+        h._encode_video = MagicMock(return_value=b"\x00" * 1024)
+        h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertNotIn("video_url", result)
+        self.assertIn("video_base64", result)
+        h._upload_video.assert_not_called()
+
+    def test_always_uploads_even_a_tiny_video(self):
+        """`always` must reach storage regardless of size."""
+        h = self._get_handler()
+        h._UPLOAD_MODE = "always"
+        h._encode_video = MagicMock(return_value=b"\x00" * 1024)
+        h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["video_url"], "https://example.com/video.mp4")
+        self.assertNotIn("video_base64", result)
+        h._upload_video.assert_called_once()
+
+    def test_never_inlines_even_a_large_video(self):
+        """`never` must skip storage even above the threshold."""
+        h = self._get_handler()
+        h._UPLOAD_MODE = "never"
+        h._encode_video = MagicMock(return_value=b"\x00" * (h._MAX_BASE64_BYTES + 1))
+        h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertIn("video_base64", result)
+        self.assertNotIn("video_url", result)
+        h._upload_video.assert_not_called()
+
+    def test_always_still_falls_back_when_storage_fails(self):
+        """A forced upload must not lose a video we already paid GPU time for."""
+        h = self._get_handler()
+        h._UPLOAD_MODE = "always"
+        h._encode_video = MagicMock(return_value=b"\x00" * 1024)
+        h._upload_video = MagicMock(side_effect=RuntimeError("R2 unreachable"))
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("video_base64", result)
+        self.assertNotIn("video_url", result)
+
+    def test_response_reports_the_encoded_size(self):
+        """`size_bytes` is what makes an `auto` delivery decision auditable."""
+        h = self._get_handler()
+        h._encode_video = MagicMock(return_value=b"\x00" * 4242)
+
+        result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["size_bytes"], 4242)
+
+    def test_threshold_is_read_from_the_environment(self):
+        """LTX_MAX_BASE64_MB has to move the auto cutoff, or it is not tunable."""
+        with patch.dict(os.environ, {"LTX_MAX_BASE64_MB": "0.001"}):
+            h = self._get_handler()
+            self.assertEqual(h._MAX_BASE64_BYTES, int(0.001 * 1024 * 1024))
+            h._encode_video = MagicMock(return_value=b"\x00" * 4096)
+            h._upload_video = MagicMock(return_value="https://example.com/video.mp4")
+
+            result = h.handler(_make_job({"prompt": "test"}))
+
+        self.assertEqual(result["video_url"], "https://example.com/video.mp4")
+
+    def test_an_unknown_upload_mode_degrades_to_auto(self):
+        """A typo in the endpoint env must not silently disable delivery."""
+        with patch.dict(os.environ, {"LTX_UPLOAD_MODE": "s3"}):
+            h = self._get_handler()
+
+        self.assertEqual(h._UPLOAD_MODE, "auto")
+
     def test_has_audio_reflects_the_generated_waveform(self):
         """LTX-2.5 emits audio alongside video; the response must report it."""
         h = self._get_handler()

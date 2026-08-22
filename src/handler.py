@@ -72,12 +72,36 @@ logger.info(
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Videos larger than this threshold are uploaded to storage instead of being
-# returned as base64.  Base64 adds ~33% overhead, so keep this conservative.
-_MAX_BASE64_BYTES = 5 * 1024 * 1024  # 5 MB
+# How the finished MP4 gets back to the caller:
+#
+#   auto   (default) — upload only when the clip exceeds _MAX_BASE64_BYTES.
+#   always           — upload whenever object storage is configured.
+#   never            — always inline base64, never touch storage.
+#
+# `auto` is the historical behaviour, and at 450p a 10-second clip encodes to
+# well under a megabyte, so `auto` means the upload path is effectively never
+# taken. Set LTX_UPLOAD_MODE=always on the endpoint to get a URL every time.
+_UPLOAD_MODE = os.environ.get("LTX_UPLOAD_MODE", "auto").strip().lower()
+
+# Size above which `auto` switches to uploading. Base64 adds ~33% overhead and
+# Runpod caps a job result at 20 MB, so the default stays conservative.
+_MAX_BASE64_BYTES = int(float(os.environ.get("LTX_MAX_BASE64_MB", "5")) * 1024 * 1024)
 
 # libx264 constant rate factor for the output MP4 (upstream default is 19).
 _CRF = int(os.environ.get("LTX_CRF", "19"))
+
+if _UPLOAD_MODE not in ("auto", "always", "never"):
+    logger.warning(
+        f"[handler] LTX_UPLOAD_MODE={_UPLOAD_MODE!r} is not one of "
+        "auto/always/never — falling back to 'auto'."
+    )
+    _UPLOAD_MODE = "auto"
+
+logger.info(
+    f"[handler] delivery: upload_mode={_UPLOAD_MODE} | "
+    f"base64 threshold={_MAX_BASE64_BYTES / 1e6:.1f} MB | "
+    f"storage={'s3' if os.environ.get('S3_BUCKET') else ('runpod' if os.environ.get('BUCKET_ENDPOINT_URL') else 'none')}"
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,13 +202,28 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     video_url: str | None = None
     video_b64: str | None = None
 
-    if len(video_bytes) > _MAX_BASE64_BYTES:
+    if _UPLOAD_MODE == "never":
+        want_upload = False
+    elif _UPLOAD_MODE == "always":
+        want_upload = True
+    else:
+        want_upload = len(video_bytes) > _MAX_BASE64_BYTES
+
+    if want_upload:
+        t_upload = time.monotonic()
         try:
             video_url = _upload_video(video_bytes, job_id)
+            logger.info(
+                f"[handler] Job {job_id} -> uploaded "
+                f"{len(video_bytes) / 1e6:.2f} MB in {time.monotonic() - t_upload:.1f}s."
+            )
         except Exception as exc:
+            # Storage being down must not lose a video we already paid GPU time
+            # for, so fall back to inlining it. Above ~15 MB that will itself
+            # fail Runpod's 20 MB result cap, hence the explicit warning.
             logger.warning(
-                f"[handler] Job {job_id} -> upload failed ({exc}); "
-                f"returning {len(video_bytes) / 1e6:.1f} MB as base64."
+                f"[handler] Job {job_id} -> upload failed ({type(exc).__name__}: {exc}); "
+                f"returning {len(video_bytes) / 1e6:.2f} MB as base64 instead."
             )
             video_b64 = base64.b64encode(video_bytes).decode("utf-8")
     else:
@@ -201,6 +240,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         "num_frames": result.num_frames,
         "fps": params.fps,
         "has_audio": _has_audio(result.audio),
+        "size_bytes": len(video_bytes),
     }
     if video_url:
         response["video_url"] = video_url
@@ -210,7 +250,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     logger.info(
         f"[handler] Job {job_id} complete. "
         f"gen={generation_time:.1f}s | {result.width}x{result.height} | "
-        f"{result.num_frames}f | audio={response['has_audio']} | seed={result.seed}"
+        f"{result.num_frames}f | audio={response['has_audio']} | seed={result.seed} | "
+        f"{len(video_bytes) / 1e6:.2f} MB via {'url' if video_url else 'base64'}"
     )
     return response
 
